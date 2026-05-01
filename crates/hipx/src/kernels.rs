@@ -66,3 +66,27 @@ pub mod vec_scalar_mul_args {
     pub const SCALE: usize = BO1;     // 4 B = 1 × i32
     pub const OUTPUT: usize = BO2;    // 8192 B = 4096 × i16
 }
+
+/// passthrough_dmas — single-column DMA-only forwarding kernel.
+/// Differs from passthrough_4k by using a MemTile to forward
+/// 4096 × i32 (16 KiB) from input to output via DMA. Single column
+/// (column_width=1) instead of full-array (8 cols), so it tests
+/// that hipx hwctx works for both partition shapes.
+pub const PASSTHROUGH_DMAS_PDI: &[u8] =
+    include_bytes!("../../../kernels/aie2p/passthrough_dmas/build/main.pdi");
+
+pub const PASSTHROUGH_DMAS_INSTS: &[u8] =
+    include_bytes!("../../../kernels/aie2p/passthrough_dmas/build/ptd_insts.bin");
+
+pub const PASSTHROUGH_DMAS_KERNEL_ID: u32 = 0x901;
+pub const PASSTHROUGH_DMAS_OPS_PER_CYCLE: u32 = 2048;
+/// Single-column partition. start_columns = [1, 2, 3, 4] in the
+/// manifest; firmware picks one when the hwctx is created.
+pub const PASSTHROUGH_DMAS_COLUMNS: u32 = 1;
+
+pub mod passthrough_dmas_args {
+    pub use super::passthrough_4k_args::*;
+    pub const INPUT: usize = BO0;     // 16384 B = 4096 × i32
+    pub const UNUSED1: usize = BO1;   // unused (rt.sequence has _ placeholder)
+    pub const OUTPUT: usize = BO2;    // 16384 B = 4096 × i32
+}
