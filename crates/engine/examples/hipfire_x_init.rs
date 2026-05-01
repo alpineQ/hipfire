@@ -157,6 +157,42 @@ fn run() {
                         total_wait_us / n_split as u128,
                         (total_submit_us + total_overlap_us + total_wait_us) / n_split as u128
                     );
+
+                    // Zero-copy bench: caller writes directly into the
+                    // pre-mapped BO regions. Skips the per-call A copy
+                    // (M*K*2 = 165 KiB) and the per-call B copy (576 B).
+                    let _ = rt.matvec_i16_288x288_init().expect("matvec init");
+                    // Pre-fill A and B once via the zero-copy buffer.
+                    {
+                        let abuf = rt.matvec_i16_288x288_a_buf().expect("a_buf");
+                        for i in 0..(m * k) {
+                            let r = i / k;
+                            let kk = i % k;
+                            let v = ((r + kk) as i16) & 0x7;
+                            abuf[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+                        }
+                    }
+                    {
+                        let bbuf = rt.matvec_i16_288x288_b_buf().expect("b_buf");
+                        for kk in 0..k {
+                            let v = (kk as i16) & 0x7;
+                            bbuf[kk * 2..kk * 2 + 2].copy_from_slice(&v.to_le_bytes());
+                        }
+                    }
+                    let n_zc = 50u32;
+                    let t = std::time::Instant::now();
+                    for _ in 0..n_zc {
+                        let seq = rt
+                            .matvec_i16_288x288_submit_zero_copy()
+                            .expect("zc submit");
+                        rt.matvec_i16_288x288_wait(seq, &mut c).expect("zc wait");
+                    }
+                    let mean_us = t.elapsed().as_micros() / n_zc as u128;
+                    let macs = 2.0 * m as f64 * k as f64;
+                    let gops = macs / (mean_us as f64 / 1e6) / 1e9;
+                    println!(
+                        "  zero-copy ({n_zc} iters): {mean_us} us mean → {gops:.2} GOp/s"
+                    );
                 } else {
                     println!("  FAIL — {errors}/{m} matvec mismatches");
                 }
