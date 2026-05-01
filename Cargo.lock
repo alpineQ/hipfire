@@ -90,6 +90,7 @@ version = "0.1.9-alpha.1"
 dependencies = [
  "byteorder",
  "hip-bridge",
+ "hipx",
  "image",
  "libc",
  "memmap2",

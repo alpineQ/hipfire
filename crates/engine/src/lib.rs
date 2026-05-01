@@ -1,4 +1,13 @@
 //! engine: GGUF model loading and LLaMA inference on RDNA GPUs.
+//!
+//! When built with `--features npu`, the engine also exposes
+//! `engine::npu` — a wrapper over `hipx` that gates NPU offload
+//! behind runtime capability detection (only Strix Halo has an NPU
+//! today). NPU paths are always opportunistic; iGPU stays
+//! correctness-load-bearing.
+
+#[cfg(feature = "npu")]
+pub mod npu;
 
 pub mod gguf;
 pub mod hfq;

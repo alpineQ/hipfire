@@ -7,10 +7,14 @@ description = "Inference orchestrator for RDNA GPUs"
 
 [features]
 deltanet = ["rdna-compute/deltanet"]
+# Strix Halo NPU offload via hipx. Optional — most RDNA targets don't
+# have an NPU, so engine compiles without it just fine.
+npu = ["dep:hipx"]
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
+hipx = { path = "../hipx", optional = true }
 memmap2 = "0.9"
 byteorder = "1"
 serde = { version = "1", features = ["derive"] }
