@@ -271,6 +271,80 @@ impl NpuRuntime {
             .map(|(seq, _)| seq)
     }
 
+    /// Zero-copy: ensure kernel resources are initialized and return
+    /// the BO sizes so the caller can use `matvec_i16_288x288_a_buf`,
+    /// `matvec_i16_288x288_b_buf` to write inputs directly. Saves the
+    /// per-call memcpy of A (165 KiB) and B (576 B). Pair with
+    /// `matvec_i16_288x288_dispatch_zero_copy()` for the full sequence.
+    pub fn matvec_i16_288x288_init(&mut self) -> Result<(usize, usize, usize), hipx::XdnaError> {
+        if self.matvec_288.is_none() {
+            // Trigger lazy init via a no-op submit-only dispatch with
+            // dummy data; the next real call refills the BOs anyway.
+            let dummy_a = vec![0i16; 288 * 288];
+            let dummy_b = vec![0i16; 288];
+            let _ = self.matvec_i16_288x288_inner(&dummy_a, &dummy_b, false, &mut [])?;
+        }
+        Ok((288 * 288, 288, 288))
+    }
+
+    /// Mutable view of the A buffer (288*288 i16, M*K row-major).
+    /// Caller writes directly; no separate memcpy needed before submit.
+    pub fn matvec_i16_288x288_a_buf(&mut self) -> Result<&mut [u8], hipx::XdnaError> {
+        let kern = self.matvec_288.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matvec kernel not initialized — call matvec_i16_288x288_init first".into(),
+        })?;
+        kern.a_bo.map()
+    }
+
+    /// Mutable view of the B vector (288 i16). Caller writes directly.
+    pub fn matvec_i16_288x288_b_buf(&mut self) -> Result<&mut [u8], hipx::XdnaError> {
+        let kern = self.matvec_288.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matvec kernel not initialized".into(),
+        })?;
+        kern.b_bo.map()
+    }
+
+    /// Zero-copy submit: assumes A and B BOs have been filled by the
+    /// caller via `matvec_i16_288x288_a_buf` / `b_buf`. Returns the
+    /// sequence number for the subsequent wait.
+    pub fn matvec_i16_288x288_submit_zero_copy(&mut self) -> Result<u64, hipx::XdnaError> {
+        use hipx::cmd::submit_exec_cmd;
+        use hipx::ert::reset_state;
+        use hipx::ioctl::SYNC_TO_DEVICE;
+
+        let kern = self.matvec_288.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matvec kernel not initialized".into(),
+        })?;
+
+        let _ = kern.a_bo.sync(SYNC_TO_DEVICE);
+        let _ = kern.b_bo.sync(SYNC_TO_DEVICE);
+        let _ = kern.c_bo.sync(SYNC_TO_DEVICE);
+
+        {
+            let cbuf = kern.cmd_bo.map()?;
+            reset_state(&mut cbuf[..4]);
+        }
+        let _ = kern.cmd_bo.sync(SYNC_TO_DEVICE);
+
+        let seq = submit_exec_cmd(
+            self.hipx.device.fd,
+            &kern.ctx,
+            &[&kern.cmd_bo],
+            &[
+                &kern.instr_bo,
+                &kern.a_bo,
+                &kern.b_bo,
+                &kern.c_bo,
+                &kern.bo3_bo,
+                &kern.bo4_bo,
+            ],
+        )?;
+        Ok(seq)
+    }
+
     /// Wait on a previously-submitted matvec sequence and copy the
     /// result into `c`. Pair with `matvec_i16_288x288_submit`.
     pub fn matvec_i16_288x288_wait(
