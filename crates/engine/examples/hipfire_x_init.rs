@@ -193,6 +193,32 @@ fn run() {
                     println!(
                         "  zero-copy ({n_zc} iters): {mean_us} us mean → {gops:.2} GOp/s"
                     );
+
+                    // Pipelined dispatch: queue N matvecs, then wait on
+                    // the last one. Tells us if the firmware/scheduler
+                    // pipelines or serializes dispatches.
+                    let depths = [2u32, 4, 8];
+                    for &depth in &depths {
+                        let total_iters = 32u32;
+                        let batches = total_iters / depth;
+                        let t = std::time::Instant::now();
+                        for _ in 0..batches {
+                            let mut last_seq = 0u64;
+                            for _ in 0..depth {
+                                last_seq = rt
+                                    .matvec_i16_288x288_submit_zero_copy()
+                                    .expect("pipe submit");
+                            }
+                            rt.matvec_i16_288x288_wait(last_seq, &mut c)
+                                .expect("pipe wait");
+                        }
+                        let total_us = t.elapsed().as_micros();
+                        let per_op_us = total_us / total_iters as u128;
+                        let gops_pipe = macs / (per_op_us as f64 / 1e6) / 1e9;
+                        println!(
+                            "  pipeline depth={depth}: {per_op_us} us/op → {gops_pipe:.2} GOp/s ({total_iters} ops)"
+                        );
+                    }
                 } else {
                     println!("  FAIL — {errors}/{m} matvec mismatches");
                 }
