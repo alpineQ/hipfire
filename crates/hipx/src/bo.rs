@@ -33,6 +33,16 @@ impl Bo {
         Self::alloc_typed(fd, size, BO_SHMEM)
     }
 
+    /// Allocate a SHMEM BO with the EXACT requested size in the
+    /// CREATE_BO ioctl (the kernel still page-aligns the actual
+    /// allocation). This matters for some firmware validations that
+    /// inspect the user-requested size — XRT for example asks for
+    /// 8 bytes for the ctrlpkts BO and 1 byte for the trace BO,
+    /// not the rounded-up 4096 we'd get from `alloc_shmem`.
+    pub fn alloc_shmem_exact(fd: i32, size: usize) -> Result<Self> {
+        Self::alloc_typed_unaligned(fd, size, BO_SHMEM)
+    }
+
     /// Allocate a DEV BO sub-allocated from the per-client DEV_HEAP.
     /// DEV BOs live in the heap region and are addressable by the NPU
     /// via the device VA returned in `xdna_addr`. Use for inputs the
@@ -71,9 +81,28 @@ impl Bo {
         Ok(bo)
     }
 
+    /// Like `alloc_typed` but passes the user-requested size directly
+    /// to CREATE_BO without page-alignment. The kernel still aligns
+    /// the actual allocation, but the request struct keeps the raw
+    /// size — needed when firmware validates against the requested
+    /// size rather than the kernel-aligned one.
+    fn alloc_typed_unaligned(fd: i32, size: usize, ty: u32) -> Result<Self> {
+        Self::alloc_typed_inner(fd, size, ty, /*page_align=*/false)
+    }
+
     fn alloc_typed(fd: i32, size: usize, ty: u32) -> Result<Self> {
+        Self::alloc_typed_inner(fd, size, ty, /*page_align=*/true)
+    }
+
+    fn alloc_typed_inner(fd: i32, size: usize, ty: u32, page_align: bool) -> Result<Self> {
         let pagesz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        let aligned = size.div_ceil(pagesz) * pagesz;
+        let aligned = if page_align {
+            size.div_ceil(pagesz) * pagesz
+        } else {
+            size
+        };
+        // For the mmap, we still need a page-aligned size internally.
+        let _ = pagesz;
 
         let mut req = DrmCreateBo {
             flags: 0,
