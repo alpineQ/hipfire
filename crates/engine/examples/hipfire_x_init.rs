@@ -272,6 +272,52 @@ fn run() {
             }
             Err(e) => println!("  FAIL: {e}"),
         }
+
+        // INT8 matmul — the natural max-throughput kernel.
+        println!("\n[hipfire-x] engine-API NPU dispatch (matmul_i8_512_4c):");
+        let mut a_i8 = vec![0i8; mm * kk];
+        let mut b_i8 = vec![0i8; kk * nn];
+        for r in 0..mm {
+            for k in 0..kk {
+                a_i8[r * kk + k] = ((r + k) as i8) & 0x7;
+            }
+        }
+        for k in 0..kk {
+            for c in 0..nn {
+                b_i8[k * nn + c] = ((k + c) as i8) & 0x7;
+            }
+        }
+        let mut c_i8 = vec![0i32; mm * nn];
+        let t0 = std::time::Instant::now();
+        match rt.matmul_i8_512_4c(&a_i8, &b_i8, &mut c_i8) {
+            Ok(()) => {
+                let warm_us = t0.elapsed().as_micros();
+                let mut errs = 0;
+                for c in 0..16 {
+                    let mut want: i32 = 0;
+                    for k in 0..kk {
+                        want += a_i8[k] as i32 * b_i8[k * nn + c] as i32;
+                    }
+                    if c_i8[c] != want { errs += 1; }
+                }
+                if errs == 0 {
+                    let n = 50u32;
+                    let t = std::time::Instant::now();
+                    for _ in 0..n {
+                        rt.matmul_i8_512_4c(&a_i8, &b_i8, &mut c_i8).expect("mm8");
+                    }
+                    let mean_us = t.elapsed().as_micros() / n as u128;
+                    let macs = 2.0 * mm as f64 * kk as f64 * nn as f64;
+                    let tops = macs / (mean_us as f64 / 1e6) / 1e12;
+                    println!(
+                        "  PASS — first {warm_us} us; warm mean {mean_us} us → {tops:.2} TOp/s INT8 ({n} iters, {mm}^3)"
+                    );
+                } else {
+                    println!("  FAIL — {errs}/16 first-row mismatches");
+                }
+            }
+            Err(e) => println!("  FAIL: {e}"),
+        }
             }
             Err(e) => println!("  FAIL: {e}"),
         }
