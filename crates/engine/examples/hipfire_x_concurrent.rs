@@ -86,69 +86,75 @@ fn run() {
         serial_gpu_us / n_iter as u128
     );
 
-    // Bench C: split-dispatch overlap. Submit NPU, do iGPU work,
-    // wait for NPU. The iGPU memset runs while the NPU is busy.
-    println!("[concurrent] C. concurrent (submit NPU, run iGPU, wait NPU)...");
-    // Init the 512^3 i8 path (we have zero-copy for this shape, not
-    // for 1024^3 yet). 512^3 dispatch is ~250 us @ 1 TOp/s — plenty
-    // long to overlap a 256 MiB iGPU memset.
-    let _ = npu.matmul_i8_512_4c_init().expect("mm 512 init");
+    // Init the 1024^3 i8 zero-copy path. Pre-fill A/B once so each
+    // dispatch is just submit + wait without a per-call memcpy.
+    let _ = npu.matmul_i8_1024_4c_init().expect("mm 1024 init");
     {
-        let abuf = npu.matmul_i8_512_4c_a_buf().expect("a_buf");
-        for r in 0..512 {
-            for k in 0..512 {
-                abuf[r * 512 + k] = (((r + k) as i8) & 0x7) as u8;
+        let abuf = npu.matmul_i8_1024_4c_a_buf().expect("a_buf");
+        for r in 0..m {
+            for k in 0..m {
+                abuf[r * m + k] = (((r + k) as i8) & 0x3) as u8;
             }
         }
     }
     {
-        let bbuf = npu.matmul_i8_512_4c_b_buf().expect("b_buf");
-        for k in 0..512 {
-            for c in 0..512 {
-                bbuf[k * 512 + c] = (((k + c) as i8) & 0x7) as u8;
+        let bbuf = npu.matmul_i8_1024_4c_b_buf().expect("b_buf");
+        for k in 0..m {
+            for c in 0..m {
+                bbuf[k * m + c] = (((k + c) as i8) & 0x3) as u8;
             }
         }
     }
-    let mut c_512 = vec![0i32; 512 * 512];
+    let mut c_1024 = vec![0i32; m * m];
 
+    // Bench C: NPU 1024^3 zero-copy alone (no iGPU work).
     let t = Instant::now();
     for _ in 0..n_iter {
-        // 1. Submit NPU work (returns ~30 us).
         let seq = npu
-            .matmul_i8_512_4c_submit_zero_copy()
-            .expect("npu submit");
-        // 2. Issue iGPU memset (returns immediately to the host, the
-        //    HIP runtime queues it on the iGPU stream).
-        hip.memset(&scratch, 0xCC, scratch_bytes).expect("hip memset C");
-        // 3. Wait for both.
-        hip.device_synchronize().expect("hip sync C");
-        npu.matmul_i8_512_4c_wait(seq, &mut c_512).expect("npu wait");
+            .matmul_i8_1024_4c_submit_zero_copy()
+            .expect("npu zc submit");
+        npu.matmul_i8_1024_4c_wait(seq, &mut c_1024).expect("npu zc wait");
+    }
+    let zc_npu_us = t.elapsed().as_micros();
+    println!(
+        "[concurrent] C. NPU 1024^3 zero-copy alone ({n_iter} iters): {zc_npu_us} us total ({} us/op)",
+        zc_npu_us / n_iter as u128
+    );
+
+    // Bench D: zero-copy NPU 1024^3 + iGPU memset, fully overlapped.
+    let t = Instant::now();
+    for _ in 0..n_iter {
+        let seq = npu
+            .matmul_i8_1024_4c_submit_zero_copy()
+            .expect("npu zc submit");
+        hip.memset(&scratch, 0xCC, scratch_bytes).expect("hip memset D");
+        hip.device_synchronize().expect("hip sync D");
+        npu.matmul_i8_1024_4c_wait(seq, &mut c_1024).expect("npu wait D");
     }
     let concurrent_us = t.elapsed().as_micros();
     println!(
-        "[concurrent]    {n_iter} concurrent ops: {concurrent_us} us total ({} us/op)",
+        "[concurrent] D. NPU 1024^3 zc + iGPU concurrent ({n_iter} iters): {concurrent_us} us total ({} us/op)",
         concurrent_us / n_iter as u128
     );
 
-    // Compare. Note: bench A uses 1024^3 (~480 us); bench C uses
-    // 512^3 (~250 us, zero-copy). The fair comparison for overlap is
-    // 512^3 NPU + 256 MiB iGPU — but we don't have a 512^3 standalone
-    // bench above. We can compute it as serial = bench_npu_512 +
-    // serial_gpu, and compare to concurrent_us.
     println!();
     println!("[concurrent] Analysis:");
-    println!("  serial baseline: {} us/op NPU (1024^3) + {} us/op iGPU = {} us/op",
-             serial_npu_us / n_iter as u128,
-             serial_gpu_us / n_iter as u128,
-             (serial_npu_us + serial_gpu_us) / n_iter as u128);
-    println!("  concurrent (NPU 512^3 + iGPU): {} us/op",
-             concurrent_us / n_iter as u128);
-    println!("  → If overlap is real, concurrent_us ≈ max(npu_512, gpu)");
-    println!("    rather than (npu_512 + gpu).");
+    let npu_zc_per = zc_npu_us / n_iter as u128;
+    let gpu_per = serial_gpu_us / n_iter as u128;
+    let conc_per = concurrent_us / n_iter as u128;
+    let serial_sum = npu_zc_per + gpu_per;
+    let saved = serial_sum.saturating_sub(conc_per);
+    let pct = if serial_sum > 0 { 100 * saved / serial_sum } else { 0 };
+    println!("  serial (NPU zc 1024^3 + iGPU): {npu_zc_per} + {gpu_per} = {serial_sum} us/op");
+    println!("  concurrent (overlapped):        {conc_per} us/op");
+    println!("  saved by overlap:               {saved} us/op ({pct}% wall-clock)");
+    let macs = 2.0 * (m as f64).powi(3);
+    let tops = macs / (npu_zc_per as f64 / 1e6) / 1e12;
+    println!("  NPU compute delivered:          {tops:.2} TOp/s INT8 ({} GMACs/op)",
+             (macs / 2e9) as u64);
 
-    // Free scratch (drop will release).
     let _ = scratch;
-    let _ = c_512;
+    let _ = c_1024;
 
     // Avoid unused warning when the bench section is short.
     let _ = Duration::from_millis(0);
