@@ -1083,6 +1083,106 @@ impl NpuRuntime {
         Ok(())
     }
 
+    /// Zero-copy initialization for 1024^3 matmul. Lazy-init the
+    /// kernel state and return (a_len, b_len, c_len) sizes.
+    pub fn matmul_i8_1024_4c_init(
+        &mut self,
+    ) -> Result<(usize, usize, usize), hipx::XdnaError> {
+        if self.matmul_i8_1024.is_none() {
+            let m = hipx::kernels::MATMUL_I8_1024_4C_M;
+            let k = hipx::kernels::MATMUL_I8_1024_4C_K;
+            let n = hipx::kernels::MATMUL_I8_1024_4C_N;
+            let dummy_a = vec![0i8; m * k];
+            let dummy_b = vec![0i8; k * n];
+            let mut dummy_c = vec![0i32; m * n];
+            self.matmul_i8_1024_4c(&dummy_a, &dummy_b, &mut dummy_c)?;
+        }
+        Ok((
+            hipx::kernels::MATMUL_I8_1024_4C_M * hipx::kernels::MATMUL_I8_1024_4C_K,
+            hipx::kernels::MATMUL_I8_1024_4C_K * hipx::kernels::MATMUL_I8_1024_4C_N,
+            hipx::kernels::MATMUL_I8_1024_4C_M * hipx::kernels::MATMUL_I8_1024_4C_N,
+        ))
+    }
+
+    pub fn matmul_i8_1024_4c_a_buf(&mut self) -> Result<&mut [u8], hipx::XdnaError> {
+        let kern = self.matmul_i8_1024.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_i8_1024 not initialized".into(),
+        })?;
+        kern.a_bo.map()
+    }
+
+    pub fn matmul_i8_1024_4c_b_buf(&mut self) -> Result<&mut [u8], hipx::XdnaError> {
+        let kern = self.matmul_i8_1024.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_i8_1024 not initialized".into(),
+        })?;
+        kern.b_bo.map()
+    }
+
+    pub fn matmul_i8_1024_4c_submit_zero_copy(&mut self) -> Result<u64, hipx::XdnaError> {
+        use hipx::cmd::submit_exec_cmd;
+        use hipx::ert::reset_state;
+        use hipx::ioctl::SYNC_TO_DEVICE;
+
+        let kern = self.matmul_i8_1024.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_i8_1024 not initialized".into(),
+        })?;
+
+        let _ = kern.a_bo.sync(SYNC_TO_DEVICE);
+        let _ = kern.b_bo.sync(SYNC_TO_DEVICE);
+        let _ = kern.c_bo.sync(SYNC_TO_DEVICE);
+
+        {
+            let cbuf = kern.cmd_bo.map()?;
+            reset_state(&mut cbuf[..4]);
+        }
+        let _ = kern.cmd_bo.sync(SYNC_TO_DEVICE);
+
+        submit_exec_cmd(
+            self.hipx.device.fd,
+            &kern.ctx,
+            &[&kern.cmd_bo],
+            &[
+                &kern.instr_bo,
+                &kern.a_bo,
+                &kern.b_bo,
+                &kern.c_bo,
+                &kern.bo3_bo,
+                &kern.bo4_bo,
+            ],
+        )
+    }
+
+    pub fn matmul_i8_1024_4c_wait(
+        &mut self,
+        seq: u64,
+        c: &mut [i32],
+    ) -> Result<(), hipx::XdnaError> {
+        use hipx::fence::timeline_wait;
+        use hipx::ioctl::SYNC_FROM_DEVICE;
+        use std::time::Duration;
+
+        let kern = self.matmul_i8_1024.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_i8_1024 not initialized".into(),
+        })?;
+        timeline_wait(
+            self.hipx.device.fd,
+            kern.ctx.syncobj_handle,
+            seq,
+            Duration::from_secs(20),
+        )?;
+        let _ = kern.c_bo.sync(SYNC_FROM_DEVICE);
+        let outp = kern.c_bo.map()?;
+        for (i, slot) in c.iter_mut().enumerate() {
+            let bytes: [u8; 4] = outp[i * 4..i * 4 + 4].try_into().unwrap();
+            *slot = i32::from_le_bytes(bytes);
+        }
+        Ok(())
+    }
+
     /// 1024×1024×1024 i8 → i32 matmul, 4-core whole-array. C = A · B.
     /// 4.46 TOp/s INT8 sustained — the closest we get to AIE peak from
     /// generic MLIR-AIE kernels (~9% of 50-TOPS peak; remaining headroom
