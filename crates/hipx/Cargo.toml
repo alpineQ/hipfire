@@ -47,3 +47,7 @@ path = "src/bin/matmul_512.rs"
 [[bin]]
 name = "hipx-matmul-i8"
 path = "src/bin/matmul_i8.rs"
+
+[[bin]]
+name = "hipx-matmul-i8-1024"
+path = "src/bin/matmul_i8_1024.rs"
