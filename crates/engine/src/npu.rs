@@ -782,6 +782,116 @@ impl NpuRuntime {
         Ok(())
     }
 
+    /// Zero-copy: ensure i8 matmul kernel is initialized and return
+    /// (m*k, k*n, m*n) sizes so the caller can use the *_buf accessors
+    /// to write A/B directly into the mapped BO regions. Pair with
+    /// `matmul_i8_512_4c_dispatch_zero_copy()`.
+    pub fn matmul_i8_512_4c_init(&mut self) -> Result<(usize, usize, usize), hipx::XdnaError> {
+        if self.matmul_i8_512.is_none() {
+            // Trigger lazy init via a dummy submit-only path.
+            let dummy = vec![0i8; 1];
+            let mut dummy_c = vec![0i32; 0];
+            // Use the actual ABI by passing properly sized slices.
+            let m = hipx::kernels::MATMUL_I8_512_4C_M;
+            let k = hipx::kernels::MATMUL_I8_512_4C_K;
+            let n = hipx::kernels::MATMUL_I8_512_4C_N;
+            let dummy_a = vec![0i8; m * k];
+            let dummy_b = vec![0i8; k * n];
+            dummy_c = vec![0i32; m * n];
+            let _ = self.matmul_i8_512_4c(&dummy_a, &dummy_b, &mut dummy_c)?;
+            let _ = dummy;
+        }
+        Ok((
+            hipx::kernels::MATMUL_I8_512_4C_M * hipx::kernels::MATMUL_I8_512_4C_K,
+            hipx::kernels::MATMUL_I8_512_4C_K * hipx::kernels::MATMUL_I8_512_4C_N,
+            hipx::kernels::MATMUL_I8_512_4C_M * hipx::kernels::MATMUL_I8_512_4C_N,
+        ))
+    }
+
+    /// Mutable view of the A buffer (m*k i8). Caller writes directly.
+    pub fn matmul_i8_512_4c_a_buf(&mut self) -> Result<&mut [u8], hipx::XdnaError> {
+        let kern = self.matmul_i8_512.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_i8_512 not initialized — call matmul_i8_512_4c_init first".into(),
+        })?;
+        kern.a_bo.map()
+    }
+
+    /// Mutable view of the B buffer (k*n i8). Caller writes directly.
+    pub fn matmul_i8_512_4c_b_buf(&mut self) -> Result<&mut [u8], hipx::XdnaError> {
+        let kern = self.matmul_i8_512.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_i8_512 not initialized".into(),
+        })?;
+        kern.b_bo.map()
+    }
+
+    /// Submit-only zero-copy dispatch (assumes A and B already filled).
+    /// Returns the firmware seq for the subsequent wait.
+    pub fn matmul_i8_512_4c_submit_zero_copy(&mut self) -> Result<u64, hipx::XdnaError> {
+        use hipx::cmd::submit_exec_cmd;
+        use hipx::ert::reset_state;
+        use hipx::ioctl::SYNC_TO_DEVICE;
+
+        let kern = self.matmul_i8_512.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_i8_512 not initialized".into(),
+        })?;
+
+        let _ = kern.a_bo.sync(SYNC_TO_DEVICE);
+        let _ = kern.b_bo.sync(SYNC_TO_DEVICE);
+        let _ = kern.c_bo.sync(SYNC_TO_DEVICE);
+
+        {
+            let cbuf = kern.cmd_bo.map()?;
+            reset_state(&mut cbuf[..4]);
+        }
+        let _ = kern.cmd_bo.sync(SYNC_TO_DEVICE);
+
+        submit_exec_cmd(
+            self.hipx.device.fd,
+            &kern.ctx,
+            &[&kern.cmd_bo],
+            &[
+                &kern.instr_bo,
+                &kern.a_bo,
+                &kern.b_bo,
+                &kern.c_bo,
+                &kern.bo3_bo,
+                &kern.bo4_bo,
+            ],
+        )
+    }
+
+    /// Wait + copy-back for matmul_i8_512_4c. `c` must have m*n=262144 elements.
+    pub fn matmul_i8_512_4c_wait(
+        &mut self,
+        seq: u64,
+        c: &mut [i32],
+    ) -> Result<(), hipx::XdnaError> {
+        use hipx::fence::timeline_wait;
+        use hipx::ioctl::SYNC_FROM_DEVICE;
+        use std::time::Duration;
+
+        let kern = self.matmul_i8_512.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_i8_512 not initialized".into(),
+        })?;
+        timeline_wait(
+            self.hipx.device.fd,
+            kern.ctx.syncobj_handle,
+            seq,
+            Duration::from_secs(10),
+        )?;
+        let _ = kern.c_bo.sync(SYNC_FROM_DEVICE);
+        let outp = kern.c_bo.map()?;
+        for (i, slot) in c.iter_mut().enumerate() {
+            let bytes: [u8; 4] = outp[i * 4..i * 4 + 4].try_into().unwrap();
+            *slot = i32::from_le_bytes(bytes);
+        }
+        Ok(())
+    }
+
     /// 512×512×512 i8 → i32 matmul, 4-core whole-array. C = A · B
     /// where A is M×K i8 row-major, B is K×N i8 row-major, C is M×N
     /// i32 row-major. ~1.97 TOp/s INT8 sustained on AIE-2P (2× the

@@ -312,6 +312,40 @@ fn run() {
                     println!(
                         "  PASS — first {warm_us} us; warm mean {mean_us} us → {tops:.2} TOp/s INT8 ({n} iters, {mm}^3)"
                     );
+
+                    // Zero-copy bench: write A/B once via the mapped BO,
+                    // then submit→wait in a tight loop. Recovers the
+                    // engine API overhead from the per-call A/B refresh.
+                    let _ = rt.matmul_i8_512_4c_init().expect("mm8 init");
+                    {
+                        let abuf = rt.matmul_i8_512_4c_a_buf().expect("a_buf");
+                        for r in 0..mm {
+                            for k in 0..kk {
+                                abuf[r * kk + k] = (((r + k) as i8) & 0x7) as u8;
+                            }
+                        }
+                    }
+                    {
+                        let bbuf = rt.matmul_i8_512_4c_b_buf().expect("b_buf");
+                        for k in 0..kk {
+                            for c in 0..nn {
+                                bbuf[k * nn + c] = (((k + c) as i8) & 0x7) as u8;
+                            }
+                        }
+                    }
+                    let n_zc = 50u32;
+                    let t = std::time::Instant::now();
+                    for _ in 0..n_zc {
+                        let seq = rt
+                            .matmul_i8_512_4c_submit_zero_copy()
+                            .expect("zc submit");
+                        rt.matmul_i8_512_4c_wait(seq, &mut c_i8).expect("zc wait");
+                    }
+                    let mean_us = t.elapsed().as_micros() / n_zc as u128;
+                    let tops = macs / (mean_us as f64 / 1e6) / 1e12;
+                    println!(
+                        "  zero-copy ({n_zc} iters): {mean_us} us mean → {tops:.2} TOp/s INT8"
+                    );
                 } else {
                     println!("  FAIL — {errs}/16 first-row mismatches");
                 }
