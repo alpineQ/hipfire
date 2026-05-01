@@ -43,7 +43,11 @@ pub fn timeline_wait(
         points: points.as_ptr() as u64,
         timeout_nsec: abs_ns,
         count_handles: 1,
-        flags: SYNCOBJ_WAIT_FLAGS_WAIT_ALL | SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
+        // Note: WAIT_FOR_SUBMIT is the right semantic — wait until the
+        // signaler has been submitted, then for the value. Without it,
+        // a timeline wait on a point that's already past the current
+        // value returns immediately as if signaled.
+        flags: SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT | SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
         first_signaled: 0,
         pad: 0,
     };

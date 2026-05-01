@@ -42,6 +42,13 @@ const fn drm_iow<T>(nr: u8) -> libc::c_ulong {
     ioc(IOC_WRITE, DRM_IOCTL_BASE, nr, std::mem::size_of::<T>())
 }
 
+/// IOWR for *generic* DRM ioctls — those whose nr is below
+/// DRM_COMMAND_BASE (e.g. PRIME, SYNCOBJ, GEM_CLOSE). The driver-
+/// specific helpers (`drm_iowr`) add the base; this one does not.
+const fn drm_iowr_generic<T>(nr: u8) -> libc::c_ulong {
+    ioc(IOC_READ | IOC_WRITE, DRM_IOCTL_BASE, nr, std::mem::size_of::<T>())
+}
+
 // amdxdna ioctl nrs (see `enum amdxdna_drm_ioctl_id` in the uapi)
 pub const NR_CREATE_HWCTX: u8 = 0;
 pub const NR_DESTROY_HWCTX: u8 = 1;
@@ -418,7 +425,7 @@ pub struct DrmSyncobjWait {
 }
 
 pub fn drm_ioctl_syncobj_wait() -> libc::c_ulong {
-    drm_iowr::<DrmSyncobjWait>(DRM_IOCTL_SYNCOBJ_WAIT_NR)
+    drm_iowr_generic::<DrmSyncobjWait>(DRM_IOCTL_SYNCOBJ_WAIT_NR)
 }
 
 #[repr(C)]
@@ -434,7 +441,7 @@ pub struct DrmSyncobjTimelineWait {
 }
 
 pub fn drm_ioctl_syncobj_timeline_wait() -> libc::c_ulong {
-    drm_iowr::<DrmSyncobjTimelineWait>(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_NR)
+    drm_iowr_generic::<DrmSyncobjTimelineWait>(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_NR)
 }
 
 // ─── DRM PRIME (dmabuf import/export) ──────────────────────────────────
@@ -458,9 +465,9 @@ pub struct DrmPrimeHandle {
 }
 
 pub fn drm_ioctl_prime_handle_to_fd() -> libc::c_ulong {
-    drm_iowr::<DrmPrimeHandle>(DRM_IOCTL_PRIME_HANDLE_TO_FD_NR)
+    drm_iowr_generic::<DrmPrimeHandle>(DRM_IOCTL_PRIME_HANDLE_TO_FD_NR)
 }
 
 pub fn drm_ioctl_prime_fd_to_handle() -> libc::c_ulong {
-    drm_iowr::<DrmPrimeHandle>(DRM_IOCTL_PRIME_FD_TO_HANDLE_NR)
+    drm_iowr_generic::<DrmPrimeHandle>(DRM_IOCTL_PRIME_FD_TO_HANDLE_NR)
 }
