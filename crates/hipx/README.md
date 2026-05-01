@@ -62,18 +62,22 @@ layers ≈ 27B Gemma depth, per-layer iGPU work matched to NPU
 dispatch time):
 
 ```
-A. iGPU-only forward:           33523 us total (1197 us/layer baseline)
-B. iGPU + NPU serial:           68956 us total (2462 us/layer)
-C. iGPU + NPU pipelined:        49171 us total (1756 us/layer)
-saved by pipelining:            19785 us (28% wall-clock vs serial)
-NPU added cost vs baseline:       559 us/layer (vs 1265 us if serial)
-NPU effective throughput:        1.22 TOp/s INT8 sustained
+A. iGPU-only forward:           33184 us total (1185 us/layer baseline)
+B. iGPU + NPU serial:           67881 us total (2424 us/layer)
+C. iGPU + NPU pipelined:        42308 us total (1511 us/layer)
+saved by pipelining:            25573 us (37% wall-clock vs serial)
+NPU added cost vs baseline:       326 us/layer (vs 1239 us if serial)
+NPU effective throughput:        1.42 TOp/s INT8 sustained
 ```
 
-Read: adding 1.22 TOp/s of NPU compute to a realistic per-layer
-LLM workflow costs only 559 µs per layer of additional wall-clock
-— 44% of what serial dispatch would cost. The other 56% is hidden
-behind iGPU work via the previous-wait/current-iGPU overlap pattern.
+Read: adding 1.42 TOp/s of NPU compute to a realistic per-layer
+LLM workflow costs only 326 µs per layer of additional wall-clock
+— 26% of what serial dispatch would cost. **74% of the NPU work
+is hidden behind iGPU work** via the previous-wait/current-iGPU
+overlap pattern + no-copy NPU wait + zero-copy A/B (caller pre-
+fills once via `_a_buf()`/`_b_buf()` and calls `_sync_inputs()`,
+then `_submit_zero_copy()` skips the A/B SYNC_BO ioctls per
+dispatch).
 
 Engine-side smoke test:
 
