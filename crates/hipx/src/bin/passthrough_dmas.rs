@@ -35,7 +35,7 @@ fn main() -> ExitCode {
         buf[..PASSTHROUGH_DMAS_PDI.len()].copy_from_slice(PASSTHROUGH_DMAS_PDI);
     }
     let _ = pdi_bo.sync(SYNC_TO_DEVICE);
-    let _ = config_cus(hipx.device.fd, &ctx, vec![pdi_bo], &[0u8]).expect("config_cus");
+    let _cu = config_cus(hipx.device.fd, &ctx, vec![pdi_bo], &[0u8]).expect("config_cus");
 
     let instr_bo = hipx.alloc_dev(PASSTHROUGH_DMAS_INSTS.len()).expect("instr alloc");
     unsafe {

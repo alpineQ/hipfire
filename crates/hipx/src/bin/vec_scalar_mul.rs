@@ -51,7 +51,11 @@ fn main() -> ExitCode {
         buf[..VEC_SCALAR_MUL_PDI.len()].copy_from_slice(VEC_SCALAR_MUL_PDI);
     }
     let _ = pdi_bo.sync(SYNC_TO_DEVICE);
-    let _ = config_cus(hipx.device.fd, &ctx, vec![pdi_bo], &[0u8])
+    // Hold the CuBinding alive — dropping it closes the PDI BO, which
+    // is fatal for kernels whose PDI > one heap page (matmul_512). For
+    // small PDIs (this kernel, passthrough_dmas) it just happens to
+    // work because instr lands inside the freed region.
+    let _cu = config_cus(hipx.device.fd, &ctx, vec![pdi_bo], &[0u8])
         .expect("config_cus");
     println!("[vsm] CU bound");
 

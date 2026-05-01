@@ -120,3 +120,27 @@ pub mod matvec_288x288_args {
     pub const B: usize = BO1;       //     576 B  (K*i16)
     pub const C: usize = BO2;       //   1 152 B  (M*i32)
 }
+
+/// 4-core whole-array i16xi16→i32 matmul, M=K=N=512, tile m=k=n=32.
+/// Uses 4 AIE columns (`n_aie_cols=4`) so it pulls the full Strix Halo
+/// AIE array into a single dispatch. C = A · B over 16M MACs per call,
+/// vs matvec_288x288's 165K MACs — a 100× compute fraction shift.
+pub const MATMUL_512_4C_PDI: &[u8] =
+    include_bytes!("../../../kernels/aie2p/matmul_512x512x512_4c/build/main.pdi");
+
+pub const MATMUL_512_4C_INSTS: &[u8] =
+    include_bytes!("../../../kernels/aie2p/matmul_512x512x512_4c/build/insts.bin");
+
+pub const MATMUL_512_4C_KERNEL_ID: u32 = 0x901;
+pub const MATMUL_512_4C_OPS_PER_CYCLE: u32 = 2048;
+pub const MATMUL_512_4C_COLUMNS: u32 = 8;
+pub const MATMUL_512_4C_M: usize = 512;
+pub const MATMUL_512_4C_K: usize = 512;
+pub const MATMUL_512_4C_N: usize = 512;
+
+pub mod matmul_512_4c_args {
+    pub use super::passthrough_4k_args::*;
+    pub const A: usize = BO0;     // 524 288 B  (M*K*i16)
+    pub const B: usize = BO1;     // 524 288 B  (K*N*i16)
+    pub const C: usize = BO2;     // 1 048 576 B (M*N*i32)
+}
