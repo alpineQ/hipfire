@@ -105,6 +105,8 @@ fn run() {
             }
         }
     }
+    // Flush A/B once. _submit_zero_copy doesn't re-sync.
+    npu.matmul_i8_1024_4c_sync_inputs().expect("sync inputs");
     let mut c_1024 = vec![0i32; m * m];
 
     // Bench C: NPU 1024^3 zero-copy alone (no iGPU work).
