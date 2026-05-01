@@ -47,6 +47,9 @@ pub struct NpuRuntime {
     /// Holds the bound CU, instruction stream, hwctx, and pre-built
     /// cmd packet so steady-state dispatch is just BO refill + submit.
     matvec_288: Option<Matvec288Kernel>,
+    /// Lazily-initialized 512×512×512 i16 matmul kernel state — same
+    /// shape as Matvec288Kernel but for whole-array (4-core) GEMM.
+    matmul_512: Option<Matmul512Kernel>,
 }
 
 /// Persistent state for the i16 288×288 matvec kernel. All BOs,
@@ -55,6 +58,20 @@ pub struct NpuRuntime {
 /// first-call setup once, then every subsequent call is the bare
 /// dispatch latency (~530 µs steady-state at the time of writing).
 struct Matvec288Kernel {
+    ctx: hipx::hwctx::Hwctx,
+    _cu: hipx::cmd::CuBinding,
+    instr_bo: hipx::Bo,
+    a_bo: hipx::Bo,
+    b_bo: hipx::Bo,
+    c_bo: hipx::Bo,
+    bo3_bo: hipx::Bo,
+    bo4_bo: hipx::Bo,
+    cmd_bo: hipx::Bo,
+}
+
+/// Persistent state for the i16 512×512×512 4-core matmul kernel.
+/// Same lifetime contract as Matvec288Kernel.
+struct Matmul512Kernel {
     ctx: hipx::hwctx::Hwctx,
     _cu: hipx::cmd::CuBinding,
     instr_bo: hipx::Bo,
@@ -112,6 +129,7 @@ impl NpuRuntime {
             family,
             available_ops,
             matvec_288: None,
+            matmul_512: None,
         })
     }
 
@@ -573,5 +591,177 @@ impl NpuRuntime {
             *slot = i32::from_le_bytes(bytes);
         }
         Ok((seq, ()))
+    }
+
+    /// 512×512×512 i16 → i32 matmul, 4-core whole-array. C = A · B
+    /// where A is M×K row-major, B is K×N row-major, C is M×N row-
+    /// major. ~1.04 TOp/s INT16 sustained on AIE-2P. Same lazy-init
+    /// + persistent-state pattern as matvec.
+    pub fn matmul_i16_512_4c(
+        &mut self,
+        a: &[i16],
+        b: &[i16],
+        c: &mut [i32],
+    ) -> Result<(), hipx::XdnaError> {
+        use hipx::cmd::{config_cus, submit_exec_cmd};
+        use hipx::ert::{reset_state, ErtBuilder};
+        use hipx::fence::timeline_wait;
+        use hipx::hwctx::HwctxBuilder;
+        use hipx::ioctl::{SYNC_FROM_DEVICE, SYNC_TO_DEVICE};
+        use hipx::kernels::{
+            matmul_512_4c_args as args, MATMUL_512_4C_COLUMNS, MATMUL_512_4C_INSTS,
+            MATMUL_512_4C_K, MATMUL_512_4C_M, MATMUL_512_4C_N,
+            MATMUL_512_4C_OPS_PER_CYCLE, MATMUL_512_4C_PDI,
+        };
+        use std::time::Duration;
+
+        let m = MATMUL_512_4C_M;
+        let k = MATMUL_512_4C_K;
+        let n = MATMUL_512_4C_N;
+        if a.len() != m * k {
+            return Err(hipx::XdnaError {
+                code: 0,
+                message: format!("matmul a.len={} != {}", a.len(), m * k),
+            });
+        }
+        if b.len() != k * n {
+            return Err(hipx::XdnaError {
+                code: 0,
+                message: format!("matmul b.len={} != {}", b.len(), k * n),
+            });
+        }
+        if c.len() != m * n {
+            return Err(hipx::XdnaError {
+                code: 0,
+                message: format!("matmul c.len={} != {}", c.len(), m * n),
+            });
+        }
+
+        if self.matmul_512.is_none() {
+            let mut hb = HwctxBuilder::default();
+            hb.num_columns = MATMUL_512_4C_COLUMNS;
+            hb.max_opc = MATMUL_512_4C_OPS_PER_CYCLE;
+            let ctx = self.hipx.create_hwctx(&hb)?;
+
+            let pdi_bo = self.hipx.alloc_dev(MATMUL_512_4C_PDI.len())?;
+            unsafe {
+                let buf = self.hipx.dev_slice(&pdi_bo)?;
+                buf[..MATMUL_512_4C_PDI.len()].copy_from_slice(MATMUL_512_4C_PDI);
+            }
+            let _ = pdi_bo.sync(SYNC_TO_DEVICE);
+            let cu = config_cus(self.hipx.device.fd, &ctx, vec![pdi_bo], &[0u8])?;
+
+            let instr_bo = self.hipx.alloc_dev(MATMUL_512_4C_INSTS.len())?;
+            unsafe {
+                let buf = self.hipx.dev_slice(&instr_bo)?;
+                buf[..MATMUL_512_4C_INSTS.len()].copy_from_slice(MATMUL_512_4C_INSTS);
+            }
+            let _ = instr_bo.sync(SYNC_TO_DEVICE);
+            let ninstr_dwords = (MATMUL_512_4C_INSTS.len() / 4) as u32;
+
+            let mut a_bo = self.hipx.alloc_shmem(m * k * 2)?;
+            let mut b_bo = self.hipx.alloc_shmem(k * n * 2)?;
+            let mut c_bo = self.hipx.alloc_shmem(m * n * 4)?;
+            let mut bo3_bo = hipx::Bo::alloc_shmem_exact(self.hipx.device.fd, 1)?;
+            let mut bo4_bo = hipx::Bo::alloc_shmem_exact(self.hipx.device.fd, 4)?;
+            let _ = a_bo.map()?;
+            let _ = b_bo.map()?;
+            let _ = c_bo.map()?;
+            let _ = bo3_bo.map()?;
+            let _ = bo4_bo.map()?;
+
+            let a_va = a_bo.host_ptr().unwrap() as u64;
+            let b_va = b_bo.host_ptr().unwrap() as u64;
+            let c_va = c_bo.host_ptr().unwrap() as u64;
+            let bo3_va = bo3_bo.host_ptr().unwrap() as u64;
+            let bo4_va = bo4_bo.host_ptr().unwrap() as u64;
+
+            let mut cmd_bo = self.hipx.alloc_cmd(4096)?;
+            {
+                let cbuf = cmd_bo.map()?;
+                let mut eb = ErtBuilder::new_start_cu(&mut cbuf[..256]);
+                eb.set_cu_mask(0x1);
+                eb.set_arg_u64(args::OPCODE, 3);
+                eb.set_arg_u64(args::INSTR_PTR, instr_bo.xdna_addr);
+                eb.set_arg_u32(args::NINSTR, ninstr_dwords);
+                eb.set_arg_u64(args::A, a_va);
+                eb.set_arg_u64(args::B, b_va);
+                eb.set_arg_u64(args::C, c_va);
+                eb.set_arg_u64(args::BO3, bo3_va);
+                eb.set_arg_u64(args::BO4, bo4_va);
+                let _ = eb.finalize(0x3C);
+            }
+            let _ = cmd_bo.sync(SYNC_TO_DEVICE);
+
+            self.matmul_512 = Some(Matmul512Kernel {
+                ctx,
+                _cu: cu,
+                instr_bo,
+                a_bo,
+                b_bo,
+                c_bo,
+                bo3_bo,
+                bo4_bo,
+                cmd_bo,
+            });
+        }
+
+        let kern = self.matmul_512.as_mut().unwrap();
+
+        {
+            let abuf = kern.a_bo.map()?;
+            for (i, &v) in a.iter().enumerate() {
+                abuf[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        let _ = kern.a_bo.sync(SYNC_TO_DEVICE);
+        {
+            let bbuf = kern.b_bo.map()?;
+            for (i, &v) in b.iter().enumerate() {
+                bbuf[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        let _ = kern.b_bo.sync(SYNC_TO_DEVICE);
+        {
+            let cbuf = kern.c_bo.map()?;
+            for byte in cbuf[..m * n * 4].iter_mut() {
+                *byte = 0;
+            }
+        }
+        let _ = kern.c_bo.sync(SYNC_TO_DEVICE);
+
+        {
+            let cbuf = kern.cmd_bo.map()?;
+            reset_state(&mut cbuf[..4]);
+        }
+        let _ = kern.cmd_bo.sync(SYNC_TO_DEVICE);
+
+        let seq = submit_exec_cmd(
+            self.hipx.device.fd,
+            &kern.ctx,
+            &[&kern.cmd_bo],
+            &[
+                &kern.instr_bo,
+                &kern.a_bo,
+                &kern.b_bo,
+                &kern.c_bo,
+                &kern.bo3_bo,
+                &kern.bo4_bo,
+            ],
+        )?;
+        timeline_wait(
+            self.hipx.device.fd,
+            kern.ctx.syncobj_handle,
+            seq,
+            Duration::from_secs(10),
+        )?;
+
+        let _ = kern.c_bo.sync(SYNC_FROM_DEVICE);
+        let outp = kern.c_bo.map()?;
+        for (i, slot) in c.iter_mut().enumerate() {
+            let bytes: [u8; 4] = outp[i * 4..i * 4 + 4].try_into().unwrap();
+            *slot = i32::from_le_bytes(bytes);
+        }
+        Ok(())
     }
 }

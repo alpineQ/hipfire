@@ -222,6 +222,56 @@ fn run() {
                 } else {
                     println!("  FAIL — {errors}/{m} matvec mismatches");
                 }
+
+        // 4-core matmul (the press-headline kernel — 1+ TOp/s INT16).
+        println!("\n[hipfire-x] engine-API NPU dispatch (matmul_i16_512_4c):");
+        let mm = 512usize;
+        let kk = 512usize;
+        let nn = 512usize;
+        let mut a_mm = vec![0i16; mm * kk];
+        let mut b_mm = vec![0i16; kk * nn];
+        for r in 0..mm {
+            for k in 0..kk {
+                a_mm[r * kk + k] = ((r + k) as i16) & 0x7;
+            }
+        }
+        for k in 0..kk {
+            for c in 0..nn {
+                b_mm[k * nn + c] = ((k + c) as i16) & 0x7;
+            }
+        }
+        let mut c_mm = vec![0i32; mm * nn];
+        let t0 = std::time::Instant::now();
+        match rt.matmul_i16_512_4c(&a_mm, &b_mm, &mut c_mm) {
+            Ok(()) => {
+                let warm_us = t0.elapsed().as_micros();
+                // verify first row
+                let mut errs = 0;
+                for c in 0..16 {
+                    let mut want: i32 = 0;
+                    for k in 0..kk {
+                        want += a_mm[k] as i32 * b_mm[k * nn + c] as i32;
+                    }
+                    if c_mm[c] != want { errs += 1; }
+                }
+                if errs == 0 {
+                    let n = 30u32;
+                    let t = std::time::Instant::now();
+                    for _ in 0..n {
+                        rt.matmul_i16_512_4c(&a_mm, &b_mm, &mut c_mm).expect("mm");
+                    }
+                    let mean_us = t.elapsed().as_micros() / n as u128;
+                    let macs = 2.0 * mm as f64 * kk as f64 * nn as f64;
+                    let tops = macs / (mean_us as f64 / 1e6) / 1e12;
+                    println!(
+                        "  PASS — first {warm_us} us; warm mean {mean_us} us → {tops:.2} TOp/s INT16 ({n} iters, {mm}^3)"
+                    );
+                } else {
+                    println!("  FAIL — {errs}/16 first-row mismatches");
+                }
+            }
+            Err(e) => println!("  FAIL: {e}"),
+        }
             }
             Err(e) => println!("  FAIL: {e}"),
         }
