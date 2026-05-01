@@ -137,23 +137,72 @@ fn run() {
         concurrent_us / n_iter as u128
     );
 
+    // Bench E + F: smaller iGPU work (32 MiB memset, ~150 us) — better
+    // matches the time-domain of typical per-layer iGPU dispatches in
+    // an LLM forward pass, and demonstrates the "free overlap" case
+    // where the iGPU work fits inside the NPU compute window.
+    let small_bytes = 32 * 1024 * 1024;
+    let small_scratch = hip.malloc(small_bytes).expect("hip malloc small");
+    // Warm up
+    for _ in 0..3 {
+        hip.memset(&small_scratch, 0xDD, small_bytes).expect("memset wm");
+        hip.device_synchronize().expect("sync wm");
+    }
+    let t = Instant::now();
+    for _ in 0..n_iter {
+        hip.memset(&small_scratch, 0xEE, small_bytes).expect("hip small");
+        hip.device_synchronize().expect("hip small sync");
+    }
+    let small_gpu_us = t.elapsed().as_micros();
+    println!(
+        "[concurrent] E. iGPU only (30× 32 MiB memset): {small_gpu_us} us total ({} us/op)",
+        small_gpu_us / n_iter as u128
+    );
+
+    let t = Instant::now();
+    for _ in 0..n_iter {
+        let seq = npu
+            .matmul_i8_1024_4c_submit_zero_copy()
+            .expect("npu zc submit F");
+        hip.memset(&small_scratch, 0xFF, small_bytes).expect("hip small F");
+        hip.device_synchronize().expect("hip small sync F");
+        npu.matmul_i8_1024_4c_wait(seq, &mut c_1024).expect("npu wait F");
+    }
+    let small_concurrent_us = t.elapsed().as_micros();
+    println!(
+        "[concurrent] F. NPU 1024^3 zc + small iGPU concurrent: {small_concurrent_us} us total ({} us/op)",
+        small_concurrent_us / n_iter as u128
+    );
+
     println!();
-    println!("[concurrent] Analysis:");
+    println!("[concurrent] Analysis (large iGPU — bandwidth contention regime):");
     let npu_zc_per = zc_npu_us / n_iter as u128;
     let gpu_per = serial_gpu_us / n_iter as u128;
     let conc_per = concurrent_us / n_iter as u128;
     let serial_sum = npu_zc_per + gpu_per;
     let saved = serial_sum.saturating_sub(conc_per);
     let pct = if serial_sum > 0 { 100 * saved / serial_sum } else { 0 };
-    println!("  serial (NPU zc 1024^3 + iGPU): {npu_zc_per} + {gpu_per} = {serial_sum} us/op");
-    println!("  concurrent (overlapped):        {conc_per} us/op");
-    println!("  saved by overlap:               {saved} us/op ({pct}% wall-clock)");
+    println!("  serial (NPU zc 1024^3 + 256 MiB iGPU): {npu_zc_per} + {gpu_per} = {serial_sum} us/op");
+    println!("  concurrent (overlapped):                {conc_per} us/op");
+    println!("  saved by overlap:                       {saved} us/op ({pct}% wall-clock)");
+
+    println!();
+    println!("[concurrent] Analysis (small iGPU — fits inside NPU window):");
+    let small_gpu_per = small_gpu_us / n_iter as u128;
+    let small_conc_per = small_concurrent_us / n_iter as u128;
+    let small_serial = npu_zc_per + small_gpu_per;
+    let small_saved = small_serial.saturating_sub(small_conc_per);
+    let small_pct = if small_serial > 0 { 100 * small_saved / small_serial } else { 0 };
+    println!("  serial (NPU zc 1024^3 + 32 MiB iGPU): {npu_zc_per} + {small_gpu_per} = {small_serial} us/op");
+    println!("  concurrent (overlapped):              {small_conc_per} us/op");
+    println!("  saved by overlap:                     {small_saved} us/op ({small_pct}% wall-clock)");
     let macs = 2.0 * (m as f64).powi(3);
     let tops = macs / (npu_zc_per as f64 / 1e6) / 1e12;
-    println!("  NPU compute delivered:          {tops:.2} TOp/s INT8 ({} GMACs/op)",
+    println!("  NPU compute delivered (zero-copy):    {tops:.2} TOp/s INT8 ({} GMACs/op)",
              (macs / 2e9) as u64);
 
     let _ = scratch;
+    let _ = small_scratch;
     let _ = c_1024;
 
     // Avoid unused warning when the bench section is short.
