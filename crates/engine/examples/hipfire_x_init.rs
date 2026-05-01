@@ -43,6 +43,36 @@ fn run() {
         let target = route(&npu, op);
         println!("  {:30}  -> {:?}", label, target);
     }
+
+    // Drive a real CU dispatch through the engine API (not just hipx
+    // standalone). Confirms the engine → hipx → firmware → kernel
+    // chain works with a real input/output buffer.
+    if let Some(mut rt) = npu {
+        println!("\n[hipfire-x] engine-API NPU dispatch (passthrough_4k):");
+        let mut input = [0u8; 4096];
+        for i in 0..4096 {
+            input[i] = (i & 0xFF) as u8;
+        }
+        match rt.passthrough_4k(&input) {
+            Ok(output) => {
+                let mut errors = 0;
+                for i in 0..4096 {
+                    if output[i] != input[i] {
+                        errors += 1;
+                    }
+                }
+                if errors == 0 {
+                    println!(
+                        "  PASS — 4096 bytes round-tripped through NPU; first 8 = {:02x?}",
+                        &output[..8]
+                    );
+                } else {
+                    println!("  FAIL — {errors}/4096 mismatches");
+                }
+            }
+            Err(e) => println!("  FAIL: {e}"),
+        }
+    }
 }
 
 #[cfg(not(feature = "npu"))]
