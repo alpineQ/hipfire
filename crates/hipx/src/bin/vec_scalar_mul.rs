@@ -10,7 +10,6 @@ use hipx::cmd::{config_cus, submit_exec_cmd};
 use hipx::ert::ErtBuilder;
 use hipx::fence::timeline_wait;
 use hipx::hwctx::HwctxBuilder;
-use hipx::ioctl::{SYNC_FROM_DEVICE, SYNC_TO_DEVICE};
 use hipx::kernels::{
     vec_scalar_mul_args as args, VEC_SCALAR_MUL_COLUMNS, VEC_SCALAR_MUL_INSTS,
     VEC_SCALAR_MUL_OPS_PER_CYCLE, VEC_SCALAR_MUL_PDI,
@@ -50,7 +49,6 @@ fn main() -> ExitCode {
         let buf = hipx.dev_slice(&pdi_bo).expect("pdi slice");
         buf[..VEC_SCALAR_MUL_PDI.len()].copy_from_slice(VEC_SCALAR_MUL_PDI);
     }
-    let _ = pdi_bo.sync(SYNC_TO_DEVICE);
     let _ = config_cus(hipx.device.fd, &ctx, vec![pdi_bo], &[0u8])
         .expect("config_cus");
     println!("[vsm] CU bound");
@@ -63,7 +61,6 @@ fn main() -> ExitCode {
         let buf = hipx.dev_slice(&instr_bo).expect("instr slice");
         buf[..VEC_SCALAR_MUL_INSTS.len()].copy_from_slice(VEC_SCALAR_MUL_INSTS);
     }
-    let _ = instr_bo.sync(SYNC_TO_DEVICE);
     let ninstr_dwords = (VEC_SCALAR_MUL_INSTS.len() / 4) as u32;
 
     // Input — 4096 × i16, fill with i (mod 256) so output is predictable
@@ -75,7 +72,8 @@ fn main() -> ExitCode {
             buf[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
         }
     }
-    let _ = input_bo.sync(SYNC_TO_DEVICE);
+    // No SYNC_BO calls — AMD test omits them, ours doesn't need them
+    // either (PASID + cache-coherent x86).
     let input_va = input_bo.host_ptr().unwrap() as u64;
 
     // Scale — 1 × i32
@@ -84,7 +82,6 @@ fn main() -> ExitCode {
         let buf = scale_bo.map().expect("scale map");
         buf[..4].copy_from_slice(&SCALE.to_le_bytes());
     }
-    let _ = scale_bo.sync(SYNC_TO_DEVICE);
     let scale_va = scale_bo.host_ptr().unwrap() as u64;
 
     // Output — sentinel pattern so we can detect "NPU wrote nothing"
@@ -93,7 +90,6 @@ fn main() -> ExitCode {
         let buf = output_bo.map().expect("output map");
         for b in buf[..OUTPUT_BYTES].iter_mut() { *b = 0xCC; }
     }
-    let _ = output_bo.sync(SYNC_TO_DEVICE);
     let output_va = output_bo.host_ptr().unwrap() as u64;
 
     // CRITICAL: AMD's vec_scalar_mul XRT-test cmd packet has all 5 BO
@@ -127,7 +123,6 @@ fn main() -> ExitCode {
         eb.set_arg_u64(args::BO4, bo4_va);
         let _ = eb.finalize(0x3C);
     }
-    let _ = cmd_bo.sync(SYNC_TO_DEVICE);
 
     let seq = match submit_exec_cmd(
         hipx.device.fd, &ctx, &[&cmd_bo],
@@ -146,7 +141,6 @@ fn main() -> ExitCode {
     }
     std::thread::sleep(Duration::from_millis(100));
 
-    let _ = output_bo.sync(SYNC_FROM_DEVICE);
     let outp = output_bo.map().expect("re-map output");
 
     let mut errors = 0;
