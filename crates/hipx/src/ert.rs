@@ -59,6 +59,17 @@ pub const fn header_state(header: u32) -> u32 {
     header & 0xF
 }
 
+/// Reset the state nibble in a CMD BO header back to ERT_CMD_STATE_NEW
+/// in place, preserving the rest of the packet (cu_mask, npu_data,
+/// kernel args, count, opcode). Required between successive submits
+/// of the *same* cmd packet — the firmware reads the state nibble and
+/// will skip a packet that's still marked COMPLETED from a prior run.
+pub fn reset_state(buf: &mut [u8]) {
+    let mut hdr = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    hdr = (hdr & !0xF) | ERT_CMD_STATE_NEW;
+    buf[0..4].copy_from_slice(&hdr.to_le_bytes());
+}
+
 /// `ert_npu_data` — 4 dwords after `cu_mask`. Tells firmware where
 /// the NPU instruction stream lives.
 #[repr(C, packed)]

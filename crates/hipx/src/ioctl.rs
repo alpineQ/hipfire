@@ -405,8 +405,17 @@ pub fn drm_ioctl_amdxdna_get_array() -> libc::c_ulong {
 // after EXEC_CMD we issue DRM_IOCTL_SYNCOBJ_WAIT against that handle.
 // These ioctl numbers live in `<drm/drm.h>` below DRM_COMMAND_BASE.
 
-const DRM_IOCTL_SYNCOBJ_WAIT_NR: u8 = 0xCA;
-const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_NR: u8 = 0xCF;
+// Per <drm/drm.h>: SYNCOBJ_WAIT=0xC3, TIMELINE_WAIT=0xCA. We had these
+// wrong (0xCA / 0xCF) for the entire bring-up — SYNCOBJ_WAIT was hitting
+// TIMELINE_WAIT (succeeding spuriously because TIMELINE_WAIT's struct
+// has extra `points` after `handles`, which our SYNCOBJ_WAIT struct
+// padded with zeros — a binary-syncobj is "signaled at point 0" by
+// definition), and TIMELINE_WAIT was hitting SYNCOBJ_EVENTFD which
+// rejected our struct shape with EINVAL. This is why Worker-class
+// kernels appeared "flaky" — we were never actually fence-waiting,
+// just sleeping 100ms via the fall-through.
+const DRM_IOCTL_SYNCOBJ_WAIT_NR: u8 = 0xC3;
+const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_NR: u8 = 0xCA;
 
 pub const SYNCOBJ_WAIT_FLAGS_WAIT_ALL: u32 = 1 << 0;
 pub const SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT: u32 = 1 << 1;

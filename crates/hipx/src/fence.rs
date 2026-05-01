@@ -20,18 +20,30 @@ pub fn wait(fd: i32, syncobj_handle: u32, timeout: Duration) -> Result<()> {
 /// completion. Waits for the syncobj's internal timeline counter to
 /// reach `point` (the firmware sequence number returned by
 /// EXEC_CMD).
+///
+/// `timeout` is the relative wait, converted to a CLOCK_MONOTONIC
+/// absolute. Pass `Duration::from_secs(0)` for "wait forever"
+/// (translates to INT64_MAX, matching AMD XRT's convention).
+///
+/// Flags match AMD XRT exactly (captured via strace of the working
+/// AMD vec_scalar_mul test): WAIT_FOR_SUBMIT only — NO WAIT_ALL.
+/// We had this set to WAIT_FOR_SUBMIT|WAIT_ALL during bring-up,
+/// which is what `drm_syncobj_wait_check` interprets via slightly
+/// different paths; sticking to WAIT_FOR_SUBMIT keeps us byte-
+/// identical to AMD's working ioctl.
 pub fn timeline_wait(
     fd: i32,
     syncobj_handle: u32,
     point: u64,
     timeout: Duration,
 ) -> Result<()> {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    let abs_ns = unsafe {
-        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    let abs_ns = if timeout.is_zero() {
+        i64::MAX
+    } else {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe {
+            libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+        }
         let now_ns = (ts.tv_sec as i64) * 1_000_000_000 + (ts.tv_nsec as i64);
         let to_ns = timeout.as_nanos().min(i64::MAX as u128) as i64;
         now_ns.saturating_add(to_ns)
@@ -43,11 +55,7 @@ pub fn timeline_wait(
         points: points.as_ptr() as u64,
         timeout_nsec: abs_ns,
         count_handles: 1,
-        // Note: WAIT_FOR_SUBMIT is the right semantic — wait until the
-        // signaler has been submitted, then for the value. Without it,
-        // a timeline wait on a point that's already past the current
-        // value returns immediately as if signaled.
-        flags: SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT | SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
+        flags: SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
         first_signaled: 0,
         pad: 0,
     };
