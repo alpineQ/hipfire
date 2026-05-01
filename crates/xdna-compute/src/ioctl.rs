@@ -38,6 +38,10 @@ const fn drm_iowr<T>(nr: u8) -> libc::c_ulong {
     )
 }
 
+const fn drm_iow<T>(nr: u8) -> libc::c_ulong {
+    ioc(IOC_WRITE, DRM_IOCTL_BASE, nr, std::mem::size_of::<T>())
+}
+
 // amdxdna ioctl nrs (see `enum amdxdna_drm_ioctl_id` in the uapi)
 pub const NR_CREATE_HWCTX: u8 = 0;
 pub const NR_DESTROY_HWCTX: u8 = 1;
@@ -147,4 +151,126 @@ pub struct GetResourceInfo {
 pub struct GetPowerMode {
     pub power_mode: u8,
     pub pad: [u8; 7],
+}
+
+// ─── BO management ─────────────────────────────────────────────────────
+
+// amdxdna_bo_type
+pub const BO_INVALID: u32 = 0;
+pub const BO_SHMEM: u32 = 1;
+pub const BO_DEV_HEAP: u32 = 2;
+pub const BO_DEV: u32 = 3;
+pub const BO_CMD: u32 = 4;
+
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct DrmCreateBo {
+    pub flags: u64,
+    pub vaddr: u64,
+    pub size: u64,
+    pub ty: u32,
+    pub handle: u32,
+}
+
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct DrmGetBoInfo {
+    pub ext: u64,
+    pub ext_flags: u64,
+    pub handle: u32,
+    pub pad: u32,
+    pub map_offset: u64,
+    pub vaddr: u64,
+    pub xdna_addr: u64,
+}
+
+pub const SYNC_TO_DEVICE: u32 = 0;
+pub const SYNC_FROM_DEVICE: u32 = 1;
+
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct DrmSyncBo {
+    pub handle: u32,
+    pub direction: u32,
+    pub offset: u64,
+    pub size: u64,
+}
+
+// Generic DRM GEM_CLOSE — used to release any DRM BO handle.
+const DRM_IOCTL_GEM_CLOSE_NR: u8 = 0x09;
+
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct DrmGemClose {
+    pub handle: u32,
+    pub pad: u32,
+}
+
+pub fn drm_ioctl_amdxdna_create_bo() -> libc::c_ulong {
+    drm_iowr::<DrmCreateBo>(NR_CREATE_BO)
+}
+
+pub fn drm_ioctl_amdxdna_get_bo_info() -> libc::c_ulong {
+    drm_iowr::<DrmGetBoInfo>(NR_GET_BO_INFO)
+}
+
+pub fn drm_ioctl_amdxdna_sync_bo() -> libc::c_ulong {
+    drm_iowr::<DrmSyncBo>(NR_SYNC_BO)
+}
+
+pub fn drm_ioctl_gem_close() -> libc::c_ulong {
+    drm_iow::<DrmGemClose>(DRM_IOCTL_GEM_CLOSE_NR)
+}
+
+// ─── HW context lifecycle ──────────────────────────────────────────────
+
+// QoS priority levels (uapi)
+pub const QOS_REALTIME_PRIORITY: u32 = 0x100;
+pub const QOS_HIGH_PRIORITY: u32 = 0x180;
+pub const QOS_NORMAL_PRIORITY: u32 = 0x200;
+pub const QOS_LOW_PRIORITY: u32 = 0x280;
+
+pub const INVALID_BO_HANDLE: u32 = 0;
+pub const INVALID_CTX_HANDLE: u32 = 0;
+
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct QosInfo {
+    pub gops: u32,
+    pub fps: u32,
+    pub dma_bandwidth: u32,
+    pub latency: u32,
+    pub frame_exec_time: u32,
+    pub priority: u32,
+}
+
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct DrmCreateHwctx {
+    pub ext: u64,
+    pub ext_flags: u64,
+    pub qos_p: u64,
+    pub umq_bo: u32,
+    pub log_buf_bo: u32,
+    pub max_opc: u32,
+    pub num_tiles: u32,
+    pub mem_size: u32,
+    pub umq_doorbell: u32,
+    pub handle: u32,
+    pub syncobj_handle: u32,
+}
+
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct DrmDestroyHwctx {
+    pub handle: u32,
+    pub pad: u32,
+}
+
+pub fn drm_ioctl_amdxdna_create_hwctx() -> libc::c_ulong {
+    drm_iowr::<DrmCreateHwctx>(NR_CREATE_HWCTX)
+}
+
+pub fn drm_ioctl_amdxdna_destroy_hwctx() -> libc::c_ulong {
+    drm_iowr::<DrmDestroyHwctx>(NR_DESTROY_HWCTX)
 }

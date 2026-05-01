@@ -18,6 +18,8 @@
 
 pub mod ioctl;
 pub mod device;
+pub mod bo;
+pub mod hwctx;
 
 #[derive(Debug)]
 pub struct XdnaError {
