@@ -259,6 +259,50 @@ impl NpuRuntime {
         Ok(out)
     }
 
+    /// Split the matvec dispatch into submit + wait phases so the
+    /// caller can run iGPU work concurrently with the NPU job.
+    /// Returns the firmware sequence number to wait on.
+    pub fn matvec_i16_288x288_submit(
+        &mut self,
+        a: &[i16],
+        b: &[i16],
+    ) -> Result<u64, hipx::XdnaError> {
+        self.matvec_i16_288x288_inner(a, b, /*wait*/ false, &mut [])
+            .map(|(seq, _)| seq)
+    }
+
+    /// Wait on a previously-submitted matvec sequence and copy the
+    /// result into `c`. Pair with `matvec_i16_288x288_submit`.
+    pub fn matvec_i16_288x288_wait(
+        &mut self,
+        seq: u64,
+        c: &mut [i32],
+    ) -> Result<(), hipx::XdnaError> {
+        use hipx::fence::timeline_wait;
+        use hipx::ioctl::SYNC_FROM_DEVICE;
+        use std::time::Duration;
+
+        let Some(kern) = self.matvec_288.as_mut() else {
+            return Err(hipx::XdnaError {
+                code: 0,
+                message: "matvec kernel not initialized".into(),
+            });
+        };
+        timeline_wait(
+            self.hipx.device.fd,
+            kern.ctx.syncobj_handle,
+            seq,
+            Duration::from_secs(5),
+        )?;
+        let _ = kern.c_bo.sync(SYNC_FROM_DEVICE);
+        let outp = kern.c_bo.map()?;
+        for (i, slot) in c.iter_mut().enumerate() {
+            let bytes: [u8; 4] = outp[i * 4..i * 4 + 4].try_into().unwrap();
+            *slot = i32::from_le_bytes(bytes);
+        }
+        Ok(())
+    }
+
     /// 288×288 i16 → i32 GEMV. Lazily initializes the kernel on first
     /// call (allocates BOs, binds CU, builds cmd packet); subsequent
     /// calls just refill the input BOs and dispatch. `a` is M×K row-
@@ -272,6 +316,18 @@ impl NpuRuntime {
         b: &[i16],
         c: &mut [i32],
     ) -> Result<(), hipx::XdnaError> {
+        let (seq, _) = self.matvec_i16_288x288_inner(a, b, /*wait*/ true, c)?;
+        let _ = seq;
+        Ok(())
+    }
+
+    fn matvec_i16_288x288_inner(
+        &mut self,
+        a: &[i16],
+        b: &[i16],
+        wait: bool,
+        c: &mut [i32],
+    ) -> Result<(u64, ()), hipx::XdnaError> {
         use hipx::cmd::{config_cus, submit_exec_cmd};
         use hipx::ert::{reset_state, ErtBuilder};
         use hipx::fence::timeline_wait;
@@ -297,7 +353,7 @@ impl NpuRuntime {
                 message: format!("matvec b.len={} != {k}", b.len()),
             });
         }
-        if c.len() != m {
+        if wait && c.len() != m {
             return Err(hipx::XdnaError {
                 code: 0,
                 message: format!("matvec c.len={} != {m}", c.len()),
@@ -426,6 +482,9 @@ impl NpuRuntime {
                 &kern.bo4_bo,
             ],
         )?;
+        if !wait {
+            return Ok((seq, ()));
+        }
         timeline_wait(
             self.hipx.device.fd,
             kern.ctx.syncobj_handle,
@@ -439,6 +498,6 @@ impl NpuRuntime {
             let bytes: [u8; 4] = outp[i * 4..i * 4 + 4].try_into().unwrap();
             *slot = i32::from_le_bytes(bytes);
         }
-        Ok(())
+        Ok((seq, ()))
     }
 }
