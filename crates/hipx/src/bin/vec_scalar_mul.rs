@@ -59,12 +59,10 @@ fn main() -> ExitCode {
         .expect("config_cus");
     println!("[vsm] CU bound");
 
-    // 32 KiB pad DEV BO between PDI and instr — places instr at
-    // xdna_addr 0x4028000, matching AMD's reference packet layout.
-    // Worker-class kernels were tested empirically and confirmed
-    // dependent on this offset; removing it triggers the firmware
-    // "complete-but-no-output" failure mode.
-    let _pad = hipx.alloc_dev(32 * 1024).expect("pad alloc");
+    // (No pad BO — earlier "instr must land at heap+0x8000" theory
+    // was a misdiagnosis of the dropped-CuBinding bug fixed in 918c3b7.
+    // Holding _cu alive keeps the PDI BO open; instr lands wherever
+    // DEV_HEAP next allocates and the firmware reads it correctly.)
 
     // Instruction stream (DEV)
     let instr_bo = match hipx.alloc_dev(VEC_SCALAR_MUL_INSTS.len()) {
