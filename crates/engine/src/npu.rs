@@ -874,8 +874,56 @@ impl NpuRuntime {
         kern.b_bo.map()
     }
 
-    /// Submit-only zero-copy dispatch (assumes A and B already filled).
-    /// Returns the firmware seq for the subsequent wait.
+    /// Flush A and B BOs to device after writing them via _a_buf/_b_buf.
+    /// _submit_zero_copy no longer auto-syncs A/B for performance — call
+    /// this once after each modification.
+    pub fn matmul_i8_512_4c_sync_inputs(&mut self) -> Result<(), hipx::XdnaError> {
+        use hipx::ioctl::SYNC_TO_DEVICE;
+        let kern = self.matmul_i8_512.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_i8_512 not initialized".into(),
+        })?;
+        let _ = kern.a_bo.sync(SYNC_TO_DEVICE);
+        let _ = kern.b_bo.sync(SYNC_TO_DEVICE);
+        Ok(())
+    }
+
+    /// Wait WITHOUT copying C back (caller reads via _c_view).
+    pub fn matmul_i8_512_4c_wait_no_copy(&mut self, seq: u64) -> Result<(), hipx::XdnaError> {
+        use hipx::fence::timeline_wait;
+        use hipx::ioctl::SYNC_FROM_DEVICE;
+        use std::time::Duration;
+
+        let kern = self.matmul_i8_512.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_i8_512 not initialized".into(),
+        })?;
+        timeline_wait(
+            self.hipx.device.fd,
+            kern.ctx.syncobj_handle,
+            seq,
+            Duration::from_secs(10),
+        )?;
+        let _ = kern.c_bo.sync(SYNC_FROM_DEVICE);
+        Ok(())
+    }
+
+    /// Borrow C as `&[i32]` (M*N = 262144 words). Valid until next submit.
+    pub fn matmul_i8_512_4c_c_view(&mut self) -> Result<&[i32], hipx::XdnaError> {
+        let kern = self.matmul_i8_512.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_i8_512 not initialized".into(),
+        })?;
+        let bytes = kern.c_bo.map()?;
+        let mn = 512 * 512;
+        let slice: &[i32] = unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr() as *const i32, mn)
+        };
+        Ok(slice)
+    }
+
+    /// Submit-only zero-copy dispatch (assumes A and B already filled
+    /// AND that _sync_inputs() has been called since the last write).
     pub fn matmul_i8_512_4c_submit_zero_copy(&mut self) -> Result<u64, hipx::XdnaError> {
         use hipx::cmd::submit_exec_cmd;
         use hipx::ert::reset_state;
@@ -886,10 +934,8 @@ impl NpuRuntime {
             message: "matmul_i8_512 not initialized".into(),
         })?;
 
-        let _ = kern.a_bo.sync(SYNC_TO_DEVICE);
-        let _ = kern.b_bo.sync(SYNC_TO_DEVICE);
-        let _ = kern.c_bo.sync(SYNC_TO_DEVICE);
-
+        // Skip A/B/C sync — A/B unchanged since _sync_inputs(),
+        // C is firmware-overwritten so no need to pre-sync.
         {
             let cbuf = kern.cmd_bo.map()?;
             reset_state(&mut cbuf[..4]);
@@ -1600,6 +1646,144 @@ impl NpuRuntime {
             Duration::from_secs(10),
         )?;
 
+        let _ = kern.c_bo.sync(SYNC_FROM_DEVICE);
+        let outp = kern.c_bo.map()?;
+        for (i, slot) in c.iter_mut().enumerate() {
+            let bytes: [u8; 4] = outp[i * 4..i * 4 + 4].try_into().unwrap();
+            *slot = f32::from_le_bytes(bytes);
+        }
+        Ok(())
+    }
+
+    /// Init the bf16 1024^3 kernel state without doing real work.
+    /// Returns (a_len, b_len, c_len) in elements.
+    pub fn matmul_bf16_1024_4c_init(
+        &mut self,
+    ) -> Result<(usize, usize, usize), hipx::XdnaError> {
+        if self.matmul_bf16_1024.is_none() {
+            let m = hipx::kernels::MATMUL_BF16_1024_4C_M;
+            let k = hipx::kernels::MATMUL_BF16_1024_4C_K;
+            let n = hipx::kernels::MATMUL_BF16_1024_4C_N;
+            let dummy_a = vec![0f32; m * k];
+            let dummy_b = vec![0f32; k * n];
+            let mut dummy_c = vec![0f32; m * n];
+            self.matmul_bf16_1024_4c(&dummy_a, &dummy_b, &mut dummy_c)?;
+        }
+        Ok((
+            hipx::kernels::MATMUL_BF16_1024_4C_M * hipx::kernels::MATMUL_BF16_1024_4C_K,
+            hipx::kernels::MATMUL_BF16_1024_4C_K * hipx::kernels::MATMUL_BF16_1024_4C_N,
+            hipx::kernels::MATMUL_BF16_1024_4C_M * hipx::kernels::MATMUL_BF16_1024_4C_N,
+        ))
+    }
+
+    /// Mutable view of A as bf16 bytes (len = M*K*2).
+    pub fn matmul_bf16_1024_4c_a_buf(&mut self) -> Result<&mut [u8], hipx::XdnaError> {
+        let kern = self.matmul_bf16_1024.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_bf16_1024 not initialized".into(),
+        })?;
+        kern.a_bo.map()
+    }
+
+    pub fn matmul_bf16_1024_4c_b_buf(&mut self) -> Result<&mut [u8], hipx::XdnaError> {
+        let kern = self.matmul_bf16_1024.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_bf16_1024 not initialized".into(),
+        })?;
+        kern.b_bo.map()
+    }
+
+    pub fn matmul_bf16_1024_4c_sync_inputs(&mut self) -> Result<(), hipx::XdnaError> {
+        use hipx::ioctl::SYNC_TO_DEVICE;
+        let kern = self.matmul_bf16_1024.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_bf16_1024 not initialized".into(),
+        })?;
+        let _ = kern.a_bo.sync(SYNC_TO_DEVICE);
+        let _ = kern.b_bo.sync(SYNC_TO_DEVICE);
+        Ok(())
+    }
+
+    pub fn matmul_bf16_1024_4c_submit_zero_copy(&mut self) -> Result<u64, hipx::XdnaError> {
+        use hipx::cmd::submit_exec_cmd;
+        use hipx::ert::reset_state;
+        use hipx::ioctl::SYNC_TO_DEVICE;
+
+        let kern = self.matmul_bf16_1024.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_bf16_1024 not initialized".into(),
+        })?;
+
+        {
+            let cbuf = kern.cmd_bo.map()?;
+            reset_state(&mut cbuf[..4]);
+        }
+        let _ = kern.cmd_bo.sync(SYNC_TO_DEVICE);
+
+        submit_exec_cmd(
+            self.hipx.device.fd,
+            &kern.ctx,
+            &[&kern.cmd_bo],
+            &[
+                &kern.instr_bo,
+                &kern.a_bo,
+                &kern.b_bo,
+                &kern.c_bo,
+                &kern.bo3_bo,
+                &kern.bo4_bo,
+            ],
+        )
+    }
+
+    pub fn matmul_bf16_1024_4c_wait_no_copy(&mut self, seq: u64) -> Result<(), hipx::XdnaError> {
+        use hipx::fence::timeline_wait;
+        use hipx::ioctl::SYNC_FROM_DEVICE;
+        use std::time::Duration;
+        let kern = self.matmul_bf16_1024.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_bf16_1024 not initialized".into(),
+        })?;
+        timeline_wait(
+            self.hipx.device.fd,
+            kern.ctx.syncobj_handle,
+            seq,
+            Duration::from_secs(20),
+        )?;
+        let _ = kern.c_bo.sync(SYNC_FROM_DEVICE);
+        Ok(())
+    }
+
+    pub fn matmul_bf16_1024_4c_c_view(&mut self) -> Result<&[f32], hipx::XdnaError> {
+        let kern = self.matmul_bf16_1024.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_bf16_1024 not initialized".into(),
+        })?;
+        let bytes = kern.c_bo.map()?;
+        let mn = 1024 * 1024;
+        let slice: &[f32] = unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr() as *const f32, mn)
+        };
+        Ok(slice)
+    }
+
+    pub fn matmul_bf16_1024_4c_wait(
+        &mut self,
+        seq: u64,
+        c: &mut [f32],
+    ) -> Result<(), hipx::XdnaError> {
+        use hipx::fence::timeline_wait;
+        use hipx::ioctl::SYNC_FROM_DEVICE;
+        use std::time::Duration;
+        let kern = self.matmul_bf16_1024.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_bf16_1024 not initialized".into(),
+        })?;
+        timeline_wait(
+            self.hipx.device.fd,
+            kern.ctx.syncobj_handle,
+            seq,
+            Duration::from_secs(20),
+        )?;
         let _ = kern.c_bo.sync(SYNC_FROM_DEVICE);
         let outp = kern.c_bo.map()?;
         for (i, slot) in c.iter_mut().enumerate() {

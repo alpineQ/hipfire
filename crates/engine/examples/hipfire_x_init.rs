@@ -333,6 +333,8 @@ fn run() {
                             }
                         }
                     }
+                    // Flush once; submit_zero_copy now skips per-call A/B sync.
+                    rt.matmul_i8_512_4c_sync_inputs().expect("sync inputs 512");
                     let n_zc = 50u32;
                     let t = std::time::Instant::now();
                     for _ in 0..n_zc {
@@ -398,6 +400,48 @@ fn run() {
             }
             Err(e) => println!("  FAIL: {e}"),
         }
+
+        // BF16 1024^3 zero-copy bench — natural-precision LLM kernel.
+        println!("\n[hipfire-x] engine-API NPU dispatch (matmul_bf16_1024_4c zero-copy):");
+        let _ = rt.matmul_bf16_1024_4c_init().expect("bf init");
+        // Pre-fill with small powers-of-2 (exact in bf16).
+        {
+            let abuf = rt.matmul_bf16_1024_4c_a_buf().expect("a_buf");
+            for r in 0..1024 {
+                for k in 0..1024 {
+                    let v: f32 = ((r + k) % 8) as f32 * 0.0625;
+                    let bf = (v.to_bits() >> 16) as u16;
+                    let off = (r * 1024 + k) * 2;
+                    abuf[off..off + 2].copy_from_slice(&bf.to_le_bytes());
+                }
+            }
+        }
+        {
+            let bbuf = rt.matmul_bf16_1024_4c_b_buf().expect("b_buf");
+            for k in 0..1024 {
+                for c in 0..1024 {
+                    let v: f32 = ((k + c) % 8) as f32 * 0.0625;
+                    let bf = (v.to_bits() >> 16) as u16;
+                    let off = (k * 1024 + c) * 2;
+                    bbuf[off..off + 2].copy_from_slice(&bf.to_le_bytes());
+                }
+            }
+        }
+        rt.matmul_bf16_1024_4c_sync_inputs().expect("bf sync");
+        let n_bf = 20u32;
+        let t = std::time::Instant::now();
+        for _ in 0..n_bf {
+            let seq = rt
+                .matmul_bf16_1024_4c_submit_zero_copy()
+                .expect("bf zc submit");
+            rt.matmul_bf16_1024_4c_wait_no_copy(seq).expect("bf wait_no_copy");
+        }
+        let mean_us = t.elapsed().as_micros() / n_bf as u128;
+        let macs = 2.0 * 1024.0 * 1024.0 * 1024.0;
+        let tops = macs / (mean_us as f64 / 1e6) / 1e12;
+        println!(
+            "  zero-copy ({n_bf} iters): {mean_us} us mean → {tops:.2} TOp/s BF16"
+        );
     }
 }
 
