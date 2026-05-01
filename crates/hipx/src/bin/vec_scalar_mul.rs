@@ -103,16 +103,21 @@ fn main() -> ExitCode {
     // why our previous attempt failed: the firmware completes the job
     // but the worker tile never writes output. Verified by capturing
     // AMD's working cmd_bo via a kernel printk in amdxdna_cmd_submit.
-    let mut bo3_bo = hipx.alloc_shmem(4096).expect("bo3 alloc");
+    // AMD strace shows XRT requests EXACT sizes for ctrlpkts/trace:
+    // ctrlpkts = 8 bytes, trace = 1 byte (kernel still page-aligns
+    // the allocation). The firmware may validate against requested
+    // size, not aligned size. Use alloc_shmem_exact to pass through
+    // the raw size in CREATE_BO.
+    let mut bo3_bo = hipx::Bo::alloc_shmem_exact(hipx.device.fd, 8).expect("bo3 alloc");
     {
         let buf = bo3_bo.map().expect("bo3 map");
-        for b in buf[..4096].iter_mut() { *b = 0; }  // pre-fault all pages
+        for b in buf.iter_mut() { *b = 0; }
     }
     let bo3_va = bo3_bo.host_ptr().unwrap() as u64;
-    let mut bo4_bo = hipx.alloc_shmem(4096).expect("bo4 alloc");
+    let mut bo4_bo = hipx::Bo::alloc_shmem_exact(hipx.device.fd, 1).expect("bo4 alloc");
     {
         let buf = bo4_bo.map().expect("bo4 map");
-        for b in buf[..4096].iter_mut() { *b = 0; }
+        for b in buf.iter_mut() { *b = 0; }
     }
     let bo4_va = bo4_bo.host_ptr().unwrap() as u64;
 
