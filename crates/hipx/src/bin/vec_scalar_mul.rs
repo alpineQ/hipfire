@@ -96,7 +96,20 @@ fn main() -> ExitCode {
     let _ = output_bo.sync(SYNC_TO_DEVICE);
     let output_va = output_bo.host_ptr().unwrap() as u64;
 
-    println!("[vsm] BOs: input={input_va:#x} scale={scale_va:#x} output={output_va:#x}");
+    // CRITICAL: AMD's vec_scalar_mul XRT-test cmd packet has all 5 BO
+    // slots (bo0..bo4) filled with real host VAs — even bo3/bo4
+    // (ctrlpkts/trace) get placeholder buffers. Leaving them at 0 is
+    // why our previous attempt failed: the firmware completes the job
+    // but the worker tile never writes output. Verified by capturing
+    // AMD's working cmd_bo via a kernel printk in amdxdna_cmd_submit.
+    let mut bo3_bo = hipx.alloc_shmem(4096).expect("bo3 alloc");
+    let _ = bo3_bo.map().expect("bo3 map");
+    let bo3_va = bo3_bo.host_ptr().unwrap() as u64;
+    let mut bo4_bo = hipx.alloc_shmem(4096).expect("bo4 alloc");
+    let _ = bo4_bo.map().expect("bo4 map");
+    let bo4_va = bo4_bo.host_ptr().unwrap() as u64;
+
+    println!("[vsm] BOs: input={input_va:#x} scale={scale_va:#x} output={output_va:#x} bo3={bo3_va:#x} bo4={bo4_va:#x}");
 
     // Cmd packet
     let mut cmd_bo = hipx.alloc_cmd(4096).expect("cmd alloc");
@@ -110,13 +123,15 @@ fn main() -> ExitCode {
         eb.set_arg_u64(args::INPUT, input_va);
         eb.set_arg_u64(args::SCALE, scale_va);
         eb.set_arg_u64(args::OUTPUT, output_va);
+        eb.set_arg_u64(args::BO3, bo3_va);
+        eb.set_arg_u64(args::BO4, bo4_va);
         let _ = eb.finalize(0x3C);
     }
     let _ = cmd_bo.sync(SYNC_TO_DEVICE);
 
     let seq = match submit_exec_cmd(
         hipx.device.fd, &ctx, &[&cmd_bo],
-        &[&instr_bo, &input_bo, &scale_bo, &output_bo],
+        &[&instr_bo, &input_bo, &scale_bo, &output_bo, &bo3_bo, &bo4_bo],
     ) {
         Ok(s) => s, Err(e) => { eprintln!("submit: {e}"); return ExitCode::FAILURE; }
     };
