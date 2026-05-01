@@ -59,3 +59,7 @@ path = "src/bin/matmul_i8_2048.rs"
 [[bin]]
 name = "hipx-matmul-bf16"
 path = "src/bin/matmul_bf16.rs"
+
+[[bin]]
+name = "hipx-matmul-bf16-1024"
+path = "src/bin/matmul_bf16_1024.rs"
