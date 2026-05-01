@@ -69,6 +69,9 @@ fn run() {
             }
         }
     }
+    // Flush A/B to device once. _submit_zero_copy no longer re-syncs
+    // them, so this drops ~30-100 µs per layer of redundant sync ioctls.
+    npu.matmul_i8_1024_4c_sync_inputs().expect("sync inputs");
     let mut c_npu = vec![0i32; m * m];
 
     // Warm-up.

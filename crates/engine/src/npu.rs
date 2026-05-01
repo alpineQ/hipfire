@@ -1152,6 +1152,20 @@ impl NpuRuntime {
         kern.b_bo.map()
     }
 
+    /// Flush A and B BOs to device after the caller has written them
+    /// via `_a_buf()` / `_b_buf()`. Call once after each modification;
+    /// `_submit_zero_copy()` no longer auto-syncs A/B for performance.
+    pub fn matmul_i8_1024_4c_sync_inputs(&mut self) -> Result<(), hipx::XdnaError> {
+        use hipx::ioctl::SYNC_TO_DEVICE;
+        let kern = self.matmul_i8_1024.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_i8_1024 not initialized".into(),
+        })?;
+        let _ = kern.a_bo.sync(SYNC_TO_DEVICE);
+        let _ = kern.b_bo.sync(SYNC_TO_DEVICE);
+        Ok(())
+    }
+
     pub fn matmul_i8_1024_4c_submit_zero_copy(&mut self) -> Result<u64, hipx::XdnaError> {
         use hipx::cmd::submit_exec_cmd;
         use hipx::ert::reset_state;
@@ -1162,10 +1176,11 @@ impl NpuRuntime {
             message: "matmul_i8_1024 not initialized".into(),
         })?;
 
-        let _ = kern.a_bo.sync(SYNC_TO_DEVICE);
-        let _ = kern.b_bo.sync(SYNC_TO_DEVICE);
-        let _ = kern.c_bo.sync(SYNC_TO_DEVICE);
-
+        // Skip A/B SYNC_TO_DEVICE in steady state — caller is expected
+        // to have called sync_inputs() once after writing A/B via
+        // _a_buf()/_b_buf(). Only the cmd packet needs syncing each
+        // dispatch (state nibble flips back to NEW). C is firmware-
+        // overwritten so no need to pre-sync it.
         {
             let cbuf = kern.cmd_bo.map()?;
             reset_state(&mut cbuf[..4]);
