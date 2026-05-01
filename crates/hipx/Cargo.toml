@@ -39,3 +39,7 @@ path = "src/bin/passthrough_dmas.rs"
 [[bin]]
 name = "hipx-matvec"
 path = "src/bin/matvec.rs"
+
+[[bin]]
+name = "hipx-matmul-512"
+path = "src/bin/matmul_512.rs"

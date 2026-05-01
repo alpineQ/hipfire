@@ -52,12 +52,15 @@ fn main() -> ExitCode {
         buf[..MATVEC_288X288_PDI.len()].copy_from_slice(MATVEC_288X288_PDI);
     }
     let _ = pdi_bo.sync(SYNC_TO_DEVICE);
-    let _ = config_cus(hipx.device.fd, &ctx, vec![pdi_bo], &[0u8])
+    // Hold the CuBinding alive — dropping it closes the PDI BO and
+    // the firmware loses its CU reference. (See matmul_512 for the
+    // root cause writeup — `let _ = config_cus(...)` was the latent
+    // bug across all our binaries; the only ones that worked did so
+    // because their PDI was small enough that the subsequent instr
+    // BO landed inside the freed page and the firmware got valid
+    // bytes by accident.)
+    let _cu = config_cus(hipx.device.fd, &ctx, vec![pdi_bo], &[0u8])
         .expect("config_cus");
-
-    // 32 KiB pad — vec_scalar_mul confirmed Worker-class is sensitive
-    // to the instr-after-pdi offset; keep the same pad here.
-    let _pad = hipx.alloc_dev(32 * 1024).expect("pad alloc");
 
     // Instruction stream (DEV)
     let instr_bo = hipx.alloc_dev(MATVEC_288X288_INSTS.len()).expect("instr alloc");
