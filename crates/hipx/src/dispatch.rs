@@ -66,13 +66,6 @@ pub fn npu_uma_with_igpu(info: &NpuInfo) -> bool {
     has_npu(info)
 }
 
-/// Whether the NPU's INT8 throughput actually beats the iGPU's i8
-/// WMMA path at the GEMM shapes hipfire's MMQ kernels run. Decided by
-/// peak TOPS comparison; refine with measured numbers post-Phase 1.5.
-pub fn npu_beats_igpu_int8(info: &NpuInfo, igpu_int8_tops_estimate: u64) -> bool {
-    npu_int8_tops(info) > igpu_int8_tops_estimate
-}
-
 /// Per-op routing decision. Engine code calls `compute_target(op,
 /// shape, runtime_caps)` to learn where to dispatch.
 ///

@@ -532,8 +532,9 @@ impl NpuRuntime {
             let _ = pdi_bo.sync(SYNC_TO_DEVICE);
             let cu = config_cus(self.hipx.device.fd, &ctx, vec![pdi_bo], &[0u8])?;
 
-            let _pad = self.hipx.alloc_dev(32 * 1024)?;
-            std::mem::forget(_pad);
+            // Note: holding `cu` alive in Matvec288Kernel keeps PDI's BO
+            // open. The earlier 32 KiB pad alloc was a workaround for the
+            // dropped-CuBinding bug (commit 918c3b7), now obsolete.
 
             let instr_bo = self.hipx.alloc_dev(MATVEC_288X288_INSTS.len())?;
             unsafe {
