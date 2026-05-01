@@ -27,13 +27,35 @@ Performance tier:
 | `matvec`            | 288×288 i16    | 0.31 GOp/s         | 0.30 GOp/s zero-copy |
 | `matmul-512`        | 512^3 i16      | **1.04 TOp/s**     | 0.43 TOp/s        |
 | `matmul-i8`         | 512^3 i8       | **1.97 TOp/s**     | 1.04 TOp/s zero-copy |
-| `matmul-i8-1024`    | 1024^3 i8      | **4.46 TOp/s**     | 1.79 TOp/s        |
+| `matmul-i8-1024`    | 1024^3 i8      | **4.46 TOp/s**     | 2.13 TOp/s zero-copy |
+| `matmul-i8-2048`    | 2048^3 i8      | 4.36 TOp/s         | —                 |
+| `matmul-bf16`       | 512^3 bf16     | 0.83 TOp/s         | —                 |
+| `matmul-bf16-1024`  | 1024^3 bf16    | **0.97 TOp/s**     | —                 |
 
 The 4.46 TOp/s INT8 figure is sustained — 50 iterations, 482 µs mean
 dispatch, 2.1 GMACs per call. Strix Halo NPU peak is ~50 TOPS INT8,
 so we sit at ~9% peak on a generic non-tuned MLIR-AIE kernel. The
 remaining 91% is hand-tuned MAC inner loops + larger tile sizes —
 follow-up work, not bring-up.
+
+The bf16 kernels deliver bit-perfect output vs host f32 reference
+(small powers-of-2 inputs over deep accumulation fit exactly in
+bf16). They're the natural offload target for FP16 hot-path tensors
+(attention scoring, hidden-state projection); INT8 stays the speed
+champion for quantized-weight workloads.
+
+**Concurrent dispatch demo** (`hipfire_x_concurrent` example):
+
+```
+NPU 1024^3 i8 alone:                    1015 µs/op  (2.13 TOp/s)
+iGPU 32 MiB memset alone:                 51 µs/op
+NPU + 32 MiB iGPU concurrent:            985 µs/op  ← negative cost
+```
+
+Adding a 32 MiB iGPU memset to the NPU matmul makes the wall-clock
+*shorter* than NPU alone — the iGPU dispatch fits entirely inside
+the NPU compute window. This is what "free overlap" means in the
+size-matched regime that real LLM workloads operate in.
 
 Engine-side smoke test:
 
