@@ -391,3 +391,76 @@ pub struct DrmGetArray {
 pub fn drm_ioctl_amdxdna_get_array() -> libc::c_ulong {
     drm_iowr::<DrmGetArray>(NR_GET_ARRAY)
 }
+
+// ─── DRM syncobj wait (generic, not amdxdna-specific) ──────────────────
+//
+// CREATE_HWCTX returns a syncobj_handle. To wait on command completion
+// after EXEC_CMD we issue DRM_IOCTL_SYNCOBJ_WAIT against that handle.
+// These ioctl numbers live in `<drm/drm.h>` below DRM_COMMAND_BASE.
+
+const DRM_IOCTL_SYNCOBJ_WAIT_NR: u8 = 0xCA;
+const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_NR: u8 = 0xCF;
+
+pub const SYNCOBJ_WAIT_FLAGS_WAIT_ALL: u32 = 1 << 0;
+pub const SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT: u32 = 1 << 1;
+pub const SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE: u32 = 1 << 2;
+
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct DrmSyncobjWait {
+    pub handles: u64,
+    /// Absolute ns timestamp (CLOCK_MONOTONIC). 0 = poll, MAX = block.
+    pub timeout_nsec: i64,
+    pub count_handles: u32,
+    pub flags: u32,
+    pub first_signaled: u32,
+    pub pad: u32,
+}
+
+pub fn drm_ioctl_syncobj_wait() -> libc::c_ulong {
+    drm_iowr::<DrmSyncobjWait>(DRM_IOCTL_SYNCOBJ_WAIT_NR)
+}
+
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct DrmSyncobjTimelineWait {
+    pub handles: u64,
+    pub points: u64,
+    pub timeout_nsec: i64,
+    pub count_handles: u32,
+    pub flags: u32,
+    pub first_signaled: u32,
+    pub pad: u32,
+}
+
+pub fn drm_ioctl_syncobj_timeline_wait() -> libc::c_ulong {
+    drm_iowr::<DrmSyncobjTimelineWait>(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_NR)
+}
+
+// ─── DRM PRIME (dmabuf import/export) ──────────────────────────────────
+//
+// Generic across DRM drivers. Used to share BOs between amdgpu (iGPU)
+// and amdxdna (NPU) without copying — the architectural moat for UMA
+// dual-engine on Strix Halo.
+
+const DRM_IOCTL_PRIME_HANDLE_TO_FD_NR: u8 = 0x2D;
+const DRM_IOCTL_PRIME_FD_TO_HANDLE_NR: u8 = 0x2E;
+
+pub const PRIME_FLAG_RDWR: u32 = libc::O_RDWR as u32;
+pub const PRIME_FLAG_CLOEXEC: u32 = libc::O_CLOEXEC as u32;
+
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct DrmPrimeHandle {
+    pub handle: u32,
+    pub flags: u32,
+    pub fd: i32,
+}
+
+pub fn drm_ioctl_prime_handle_to_fd() -> libc::c_ulong {
+    drm_iowr::<DrmPrimeHandle>(DRM_IOCTL_PRIME_HANDLE_TO_FD_NR)
+}
+
+pub fn drm_ioctl_prime_fd_to_handle() -> libc::c_ulong {
+    drm_iowr::<DrmPrimeHandle>(DRM_IOCTL_PRIME_FD_TO_HANDLE_NR)
+}
