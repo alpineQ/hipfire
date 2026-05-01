@@ -1,0 +1,13 @@
+[package]
+name = "xdna-compute"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Direct-KMD AIE-2P / XDNA NPU compute — bypass XRT, talk to amdxdna driver"
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "xdna-probe"
+path = "src/bin/probe.rs"
