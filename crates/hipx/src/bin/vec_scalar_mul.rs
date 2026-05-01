@@ -10,6 +10,7 @@ use hipx::cmd::{config_cus, submit_exec_cmd};
 use hipx::ert::ErtBuilder;
 use hipx::fence::timeline_wait;
 use hipx::hwctx::HwctxBuilder;
+use hipx::ioctl::{SYNC_FROM_DEVICE, SYNC_TO_DEVICE};
 use hipx::kernels::{
     vec_scalar_mul_args as args, VEC_SCALAR_MUL_COLUMNS, VEC_SCALAR_MUL_INSTS,
     VEC_SCALAR_MUL_OPS_PER_CYCLE, VEC_SCALAR_MUL_PDI,
@@ -49,13 +50,16 @@ fn main() -> ExitCode {
         let buf = hipx.dev_slice(&pdi_bo).expect("pdi slice");
         buf[..VEC_SCALAR_MUL_PDI.len()].copy_from_slice(VEC_SCALAR_MUL_PDI);
     }
+    let _ = pdi_bo.sync(SYNC_TO_DEVICE);
     let _ = config_cus(hipx.device.fd, &ctx, vec![pdi_bo], &[0u8])
         .expect("config_cus");
     println!("[vsm] CU bound");
 
-    // EXPERIMENT: insert a 32 KB padding DEV BO between PDI and instr
-    // so that instr lands at xdna_addr 0x04028000 (matches AMD's
-    // working layout instead of our 0x04020000).
+    // 32 KiB pad DEV BO between PDI and instr — places instr at
+    // xdna_addr 0x4028000, matching AMD's reference packet layout.
+    // Worker-class kernels were tested empirically and confirmed
+    // dependent on this offset; removing it triggers the firmware
+    // "complete-but-no-output" failure mode.
     let _pad = hipx.alloc_dev(32 * 1024).expect("pad alloc");
 
     // Instruction stream (DEV)
@@ -66,6 +70,7 @@ fn main() -> ExitCode {
         let buf = hipx.dev_slice(&instr_bo).expect("instr slice");
         buf[..VEC_SCALAR_MUL_INSTS.len()].copy_from_slice(VEC_SCALAR_MUL_INSTS);
     }
+    let _ = instr_bo.sync(SYNC_TO_DEVICE);
     let ninstr_dwords = (VEC_SCALAR_MUL_INSTS.len() / 4) as u32;
 
     // Input — 4096 × i16, fill with i (mod 256) so output is predictable
@@ -77,8 +82,7 @@ fn main() -> ExitCode {
             buf[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
         }
     }
-    // No SYNC_BO calls — AMD test omits them, ours doesn't need them
-    // either (PASID + cache-coherent x86).
+    let _ = input_bo.sync(SYNC_TO_DEVICE);
     let input_va = input_bo.host_ptr().unwrap() as u64;
 
     // Scale — 1 × i32
@@ -87,6 +91,7 @@ fn main() -> ExitCode {
         let buf = scale_bo.map().expect("scale map");
         buf[..4].copy_from_slice(&SCALE.to_le_bytes());
     }
+    let _ = scale_bo.sync(SYNC_TO_DEVICE);
     let scale_va = scale_bo.host_ptr().unwrap() as u64;
 
     // Output — sentinel pattern so we can detect "NPU wrote nothing"
@@ -95,6 +100,7 @@ fn main() -> ExitCode {
         let buf = output_bo.map().expect("output map");
         for b in buf[..OUTPUT_BYTES].iter_mut() { *b = 0xCC; }
     }
+    let _ = output_bo.sync(SYNC_TO_DEVICE);
     let output_va = output_bo.host_ptr().unwrap() as u64;
 
     // CRITICAL: AMD's vec_scalar_mul XRT-test cmd packet has all 5 BO
@@ -113,12 +119,14 @@ fn main() -> ExitCode {
         let buf = bo3_bo.map().expect("bo3 map");
         for b in buf.iter_mut() { *b = 0; }
     }
+    let _ = bo3_bo.sync(SYNC_TO_DEVICE);
     let bo3_va = bo3_bo.host_ptr().unwrap() as u64;
     let mut bo4_bo = hipx::Bo::alloc_shmem_exact(hipx.device.fd, 1).expect("bo4 alloc");
     {
         let buf = bo4_bo.map().expect("bo4 map");
         for b in buf.iter_mut() { *b = 0; }
     }
+    let _ = bo4_bo.sync(SYNC_TO_DEVICE);
     let bo4_va = bo4_bo.host_ptr().unwrap() as u64;
 
     println!("[vsm] BOs: input={input_va:#x} scale={scale_va:#x} output={output_va:#x} bo3={bo3_va:#x} bo4={bo4_va:#x}");
@@ -140,30 +148,40 @@ fn main() -> ExitCode {
         let _ = eb.finalize(0x3C);
     }
 
-    // Run 5 iterations IN-PROCESS to test stability — engine integration
+    // Run 50 iterations IN-PROCESS to test stability — engine integration
     // creates ONE NpuRuntime per process and reuses it across many ops.
     let mut total_pass = 0;
     let mut total_fail = 0;
-    for iter in 0..5 {
+    for iter in 0..50 {
         // Reset output to sentinel
         {
             let buf = output_bo.map().expect("output reset");
             for b in buf[..OUTPUT_BYTES].iter_mut() { *b = 0xCC; }
         }
+        let _ = output_bo.sync(SYNC_TO_DEVICE);
+        // Reset cmd packet state nibble to NEW — firmware skips re-execution
+        // of a packet still marked COMPLETED from the prior submit.
+        {
+            let cbuf = cmd_bo.map().expect("cmd reset");
+            hipx::ert::reset_state(&mut cbuf[..4]);
+        }
+        let _ = cmd_bo.sync(SYNC_TO_DEVICE);
         let seq = match submit_exec_cmd(
             hipx.device.fd, &ctx, &[&cmd_bo],
             &[&instr_bo, &input_bo, &scale_bo, &output_bo, &bo3_bo, &bo4_bo],
         ) {
             Ok(s) => s, Err(e) => { eprintln!("submit iter {iter}: {e}"); return ExitCode::FAILURE; }
         };
-        for point in [seq, seq + 1, seq.saturating_add(2)] {
-            if timeline_wait(hipx.device.fd, ctx.syncobj_handle, point,
-                             Duration::from_secs(5)).is_ok() {
-                break;
-            }
+        // amdxdna registers fence at point=seq directly (kernel: aie2_ctx.c
+        // does `drm_syncobj_add_point(syncobj, chain, fence, *seq)` where
+        // *seq is the same value EXEC_CMD returns to userspace).
+        if let Err(e) = timeline_wait(hipx.device.fd, ctx.syncobj_handle, seq,
+                                      Duration::from_secs(5)) {
+            eprintln!("[vsm] iter {iter} seq={seq} timeline_wait: {e}");
+            return ExitCode::FAILURE;
         }
-        std::thread::sleep(Duration::from_millis(100));
 
+        let _ = output_bo.sync(SYNC_FROM_DEVICE);
         let outp = output_bo.map().expect("re-map output");
         let mut errors = 0;
         for i in 0..N_ELEMS {
@@ -173,7 +191,6 @@ fn main() -> ExitCode {
             if got != want { errors += 1; }
         }
         if errors == 0 {
-            println!("[vsm] iter {iter} seq={seq} PASS");
             total_pass += 1;
         } else {
             println!("[vsm] iter {iter} seq={seq} FAIL ({errors}/{N_ELEMS} mismatches)");

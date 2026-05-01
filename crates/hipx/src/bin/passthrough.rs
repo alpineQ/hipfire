@@ -241,28 +241,11 @@ fn main() -> ExitCode {
     };
     println!("[passthrough] EXEC_CMD seq={seq}");
 
-    // (10) Timeline wait at the returned sequence. Try point=seq+1
-    // (1-indexed) which is the AMD/XRT convention.
-    let mut waited = false;
-    for point in [seq, seq + 1, seq.saturating_add(2)] {
-        if timeline_wait(
-            hipx.device.fd,
-            ctx.syncobj_handle,
-            point,
-            Duration::from_secs(5),
-        )
-        .is_ok()
-        {
-            println!("[passthrough] timeline_wait point={point} returned");
-            waited = true;
-            break;
-        }
-    }
-    if !waited {
-        eprintln!("[passthrough] all timeline_wait points failed; sleeping 100ms");
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    println!("[passthrough] syncobj signaled");
+    // (10) Timeline wait at the returned sequence (point=seq exactly,
+    // matching aie2_ctx.c's drm_syncobj_add_point(syncobj, chain, fence, seq)).
+    timeline_wait(hipx.device.fd, ctx.syncobj_handle, seq,
+                  Duration::from_secs(5)).expect("timeline_wait");
+    println!("[passthrough] syncobj signaled at point={seq}");
 
     // (11) verify
     let _ = output_bo.sync(hipx::ioctl::SYNC_FROM_DEVICE);

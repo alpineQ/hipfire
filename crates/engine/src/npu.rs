@@ -220,21 +220,14 @@ impl NpuRuntime {
             &[&instr_bo, &input_bo, &output_bo],
         )?;
 
-        // wait — same multi-point fallback as the standalone binary;
-        // 100ms safety sleep for when timeline_wait EINVALs.
-        for point in [seq, seq + 1, seq.saturating_add(2)] {
-            if timeline_wait(
-                self.hipx.device.fd,
-                ctx.syncobj_handle,
-                point,
-                Duration::from_secs(5),
-            )
-            .is_ok()
-            {
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
+        // wait — point=seq matches aie2_ctx.c's
+        // drm_syncobj_add_point(syncobj, chain, fence, seq).
+        timeline_wait(
+            self.hipx.device.fd,
+            ctx.syncobj_handle,
+            seq,
+            Duration::from_secs(5),
+        )?;
 
         let _ = output_bo.sync(SYNC_FROM_DEVICE);
         let outp = output_bo.map()?;
