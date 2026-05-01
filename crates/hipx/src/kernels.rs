@@ -43,3 +43,26 @@ pub mod passthrough_4k_args {
     pub const BO3: usize = 0x2C;
     pub const BO4: usize = 0x34;
 }
+
+/// vector_scalar_mul int16 — second proof kernel showing real
+/// compute (not just passthrough). Multiplies `4096 × i16` by an
+/// `i32` scalar, writes 4096 × i16. Single column, single core
+/// tile. PDI 3024 B, instruction stream 420 B.
+pub const VEC_SCALAR_MUL_PDI: &[u8] =
+    include_bytes!("../../../kernels/aie2p/vec_scalar_mul/build/main.pdi");
+
+pub const VEC_SCALAR_MUL_INSTS: &[u8] =
+    include_bytes!("../../../kernels/aie2p/vec_scalar_mul/build/insts_in1_size.bin");
+
+pub const VEC_SCALAR_MUL_KERNEL_ID: u32 = 0x901;
+pub const VEC_SCALAR_MUL_OPS_PER_CYCLE: u32 = 2048;
+pub const VEC_SCALAR_MUL_COLUMNS: u32 = 8;
+
+/// Same 8-arg DPU layout as passthrough — 5 BO slots after the
+/// header (opcode, instr_ptr, ninstr).
+pub mod vec_scalar_mul_args {
+    pub use super::passthrough_4k_args::*;
+    pub const INPUT: usize = BO0;     // 8192 B = 4096 × i16
+    pub const SCALE: usize = BO1;     // 4 B = 1 × i32
+    pub const OUTPUT: usize = BO2;    // 8192 B = 4096 × i16
+}
