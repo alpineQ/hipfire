@@ -53,6 +53,11 @@ fn main() -> ExitCode {
         .expect("config_cus");
     println!("[vsm] CU bound");
 
+    // EXPERIMENT: insert a 32 KB padding DEV BO between PDI and instr
+    // so that instr lands at xdna_addr 0x04028000 (matches AMD's
+    // working layout instead of our 0x04020000).
+    let _pad = hipx.alloc_dev(32 * 1024).expect("pad alloc");
+
     // Instruction stream (DEV)
     let instr_bo = match hipx.alloc_dev(VEC_SCALAR_MUL_INSTS.len()) {
         Ok(b) => b, Err(e) => { eprintln!("instr alloc: {e}"); return ExitCode::FAILURE; }
@@ -99,10 +104,16 @@ fn main() -> ExitCode {
     // but the worker tile never writes output. Verified by capturing
     // AMD's working cmd_bo via a kernel printk in amdxdna_cmd_submit.
     let mut bo3_bo = hipx.alloc_shmem(4096).expect("bo3 alloc");
-    let _ = bo3_bo.map().expect("bo3 map");
+    {
+        let buf = bo3_bo.map().expect("bo3 map");
+        for b in buf[..4096].iter_mut() { *b = 0; }  // pre-fault all pages
+    }
     let bo3_va = bo3_bo.host_ptr().unwrap() as u64;
     let mut bo4_bo = hipx.alloc_shmem(4096).expect("bo4 alloc");
-    let _ = bo4_bo.map().expect("bo4 map");
+    {
+        let buf = bo4_bo.map().expect("bo4 map");
+        for b in buf[..4096].iter_mut() { *b = 0; }
+    }
     let bo4_va = bo4_bo.host_ptr().unwrap() as u64;
 
     println!("[vsm] BOs: input={input_va:#x} scale={scale_va:#x} output={output_va:#x} bo3={bo3_va:#x} bo4={bo4_va:#x}");
