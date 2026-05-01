@@ -144,3 +144,26 @@ pub mod matmul_512_4c_args {
     pub const B: usize = BO1;     // 524 288 B  (K*N*i16)
     pub const C: usize = BO2;     // 1 048 576 B (M*N*i32)
 }
+
+/// 4-core whole-array i8×i8→i32 matmul, M=K=N=512, tile m=k=n=64.
+/// Same shape as MATMUL_512_4C but at i8 precision — half the BO
+/// volume on inputs, double the AIE MAC throughput per cycle.
+pub const MATMUL_I8_512_4C_PDI: &[u8] =
+    include_bytes!("../../../kernels/aie2p/matmul_i8_512_4c/build/main.pdi");
+
+pub const MATMUL_I8_512_4C_INSTS: &[u8] =
+    include_bytes!("../../../kernels/aie2p/matmul_i8_512_4c/build/insts.bin");
+
+pub const MATMUL_I8_512_4C_KERNEL_ID: u32 = 0x901;
+pub const MATMUL_I8_512_4C_OPS_PER_CYCLE: u32 = 2048;
+pub const MATMUL_I8_512_4C_COLUMNS: u32 = 8;
+pub const MATMUL_I8_512_4C_M: usize = 512;
+pub const MATMUL_I8_512_4C_K: usize = 512;
+pub const MATMUL_I8_512_4C_N: usize = 512;
+
+pub mod matmul_i8_512_4c_args {
+    pub use super::passthrough_4k_args::*;
+    pub const A: usize = BO0;     // 262 144 B  (M*K*i8)
+    pub const B: usize = BO1;     // 262 144 B  (K*N*i8)
+    pub const C: usize = BO2;     // 1 048 576 B (M*N*i32)
+}
