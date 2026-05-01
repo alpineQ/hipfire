@@ -1215,6 +1215,51 @@ impl NpuRuntime {
         Ok(())
     }
 
+    /// Wait for matmul completion WITHOUT copying C back. Caller can
+    /// read C in place via `matmul_i8_1024_4c_c_buf()` after this
+    /// returns. Cuts ~500 µs of host-side copy work per dispatch in
+    /// the pipelined path; useful when the engine consumes C directly
+    /// or hands it to another op without a round-trip through user
+    /// memory.
+    pub fn matmul_i8_1024_4c_wait_no_copy(&mut self, seq: u64) -> Result<(), hipx::XdnaError> {
+        use hipx::fence::timeline_wait;
+        use hipx::ioctl::SYNC_FROM_DEVICE;
+        use std::time::Duration;
+
+        let kern = self.matmul_i8_1024.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_i8_1024 not initialized".into(),
+        })?;
+        timeline_wait(
+            self.hipx.device.fd,
+            kern.ctx.syncobj_handle,
+            seq,
+            Duration::from_secs(20),
+        )?;
+        let _ = kern.c_bo.sync(SYNC_FROM_DEVICE);
+        Ok(())
+    }
+
+    /// Borrow the C buffer as an `&[i32]` slice. Valid only after a
+    /// successful `_wait` or `_wait_no_copy`; data is invalidated by
+    /// the next submit (the C BO is reused). Length = M*N i32 words.
+    pub fn matmul_i8_1024_4c_c_view(&mut self) -> Result<&[i32], hipx::XdnaError> {
+        let kern = self.matmul_i8_1024.as_mut().ok_or(hipx::XdnaError {
+            code: 0,
+            message: "matmul_i8_1024 not initialized".into(),
+        })?;
+        let bytes = kern.c_bo.map()?;
+        let m = hipx::kernels::MATMUL_I8_1024_4C_M;
+        let n = hipx::kernels::MATMUL_I8_1024_4C_N;
+        // SAFETY: the C BO is mmap'd as bytes, page-aligned, and we
+        // know it holds exactly M*N i32 words written by the firmware.
+        // The lifetime is tied to &mut self via the Bo borrow.
+        let slice: &[i32] = unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr() as *const i32, m * n)
+        };
+        Ok(slice)
+    }
+
     /// 1024×1024×1024 i8 → i32 matmul, 4-core whole-array. C = A · B.
     /// 4.46 TOp/s INT8 sustained — the closest we get to AIE peak from
     /// generic MLIR-AIE kernels (~9% of 50-TOPS peak; remaining headroom

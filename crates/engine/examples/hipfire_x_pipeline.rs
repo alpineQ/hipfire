@@ -122,21 +122,21 @@ fn run() {
         let seq = npu
             .matmul_i8_1024_4c_submit_zero_copy()
             .expect("submit C");
-        // 2. Wait PREVIOUS layer's NPU — blocks for its host copy-
-        //    back (~500 µs). The NEW NPU is already making progress
-        //    during this wait (compute side runs in parallel).
+        // 2. Wait PREVIOUS layer's NPU WITHOUT copying C back —
+        //    just sync_from_device + fence wait (~50 µs vs ~500 µs).
+        //    The previous result stays in the C BO; if the engine
+        //    needed it, it would call _c_view() before submitting
+        //    the next NPU.
         if let Some(prev) = prev_seq.take() {
-            npu.matmul_i8_1024_4c_wait(prev, &mut c_npu).expect("wait C prev");
+            npu.matmul_i8_1024_4c_wait_no_copy(prev).expect("wait_no_copy C prev");
         }
-        // 3. iGPU work for THIS layer. Runs concurrent with NEW NPU
-        //    that's still completing its compute. By the time iGPU
-        //    sync returns, the NEW NPU is done — its wait is bare.
+        // 3. iGPU work for THIS layer. Runs concurrent with NEW NPU.
         hip.memset(&scratch, 0xDD, small_bytes).expect("memset C");
         hip.device_synchronize().expect("sync C");
         prev_seq = Some(seq);
         let _ = layer;
     }
-    // Final drain.
+    // Final drain — copy out the last layer's result for verification.
     if let Some(prev) = prev_seq.take() {
         npu.matmul_i8_1024_4c_wait(prev, &mut c_npu).expect("wait C final");
     }
