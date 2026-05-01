@@ -23,3 +23,7 @@ path = "src/bin/hwctx_roundtrip.rs"
 [[bin]]
 name = "hipx-overview"
 path = "src/bin/overview.rs"
+
+[[bin]]
+name = "hipx-passthrough"
+path = "src/bin/passthrough.rs"
