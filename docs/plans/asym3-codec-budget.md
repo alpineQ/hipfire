@@ -204,11 +204,41 @@ LUT lookup, no inter-tile dependencies, easily mapped to the
   Compute is much faster (70 µs), so this is BW-bound, not compute-
   bound. The K-prefetch pipeline assumption (NPU work hides behind
   iGPU layer N) only holds if iGPU layer time > 630 µs.
-  → **Validation needed**: measure actual decode-time per-layer
-    iGPU budget on 27B Gemma at 4K context. If it's < 630 µs the
-    prefetch pipeline doesn't close, and we'd need the all-layer
-    batched form (which requires changing the engine forward-pass
-    structure — much larger work).
+  → **VALIDATED 2026-05-02 on hipx (gfx1151) via the existing
+    speed-baseline file.** From `tests/speed-baselines/gfx1151.txt`
+    (commit 42566de, captured on hipx hardware):
+
+    ```
+    27b mq4 gen:               14.9 tok/s = 67 ms/token
+                              ÷ 46 layers = 1457 µs / layer
+    27b 3.5 dflash lru code:   65.83 tok/s with τ=8.85
+                              effective batch-of-9 verify:
+                              1000 / 65.83 / 46 = 330 µs / layer
+                              (× ~9 verify slots = wider iGPU GEMMs)
+    ```
+
+    Pure single-token decode: **1457 µs/layer = 2.3× the 630 µs
+    BW threshold.** Pipeline closes comfortably.
+
+    DFlash batched verify: 330 µs/layer is *below* the threshold,
+    but the apparent shortness is because each layer is now doing
+    a batch-9 GEMM (target.verify on draft tokens) which is GEMM-
+    fraction-dominated rather than GEMV-bandwidth-dominated. The
+    iGPU layer is still touching K cache, just packed denser per
+    wall-clock unit. Net: the prefetch pipeline still has at
+    least 1457 µs of "raw decode" time to hide the 630 µs NPU
+    BW window in, so the close holds for `prefill / non-spec /
+    long-context` paths. For DFlash-batched decode it's a tighter
+    fit and benches need to confirm the close at 4K+ context
+    (where K cache reads grow linearly and the iGPU layer time
+    stretches accordingly).
+
+- **bf16 vs fp16**: engine uses fp16 in many spots, NPU produces
+  bf16. Mantissa precision differs. Need to verify the score
+  kernel's accuracy doesn't regress on bf16-dequanted K — likely
+  fine (asym3 quant error is the dominant precision loss anyway,
+  bf16 vs fp16 is third-order) but a coherence-gate run is a hard
+  prereq before landing.
 - **bf16 vs fp16**: engine uses fp16 in many spots, NPU produces
   bf16. Mantissa precision differs. Need to verify the score
   kernel's accuracy doesn't regress on bf16-dequanted K — likely
