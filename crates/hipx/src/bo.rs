@@ -20,6 +20,9 @@ pub struct Bo {
     pub xdna_addr: u64,
     map_offset: u64,
     mapping: Option<(NonNull<u8>, usize)>,
+    /// Whether this BO is a DEV_HEAP (drives MAP_HUGETLB choice on
+    /// mmap; the firmware MAP_HOST_BUFFER needs huge-page backing).
+    pub(crate) is_dev_heap: bool,
 }
 
 impl Bo {
@@ -121,35 +124,118 @@ impl Bo {
             xdna_addr: info.xdna_addr,
             map_offset: info.map_offset,
             mapping: None,
+            is_dev_heap: ty == BO_DEV_HEAP,
         })
     }
 
     /// mmap the BO into the process address space. Idempotent.
+    ///
+    /// DEV_HEAP requires a specific dance to satisfy the AIE-2P
+    /// firmware's MAP_HOST_BUFFER protocol (verified via strace of
+    /// xrt-smi):
+    ///   1. mmap(anon, 2 × heap_size) to reserve VA space
+    ///   2. find the next `heap_size`-aligned address inside it
+    ///   3. mmap(MAP_SHARED | MAP_FIXED | MAP_LOCKED) at that addr
+    ///      against the device fd at the BO's map_offset
+    /// MAP_LOCKED page-locks the heap so PASID translation always
+    /// hits resident pages; MAP_FIXED at an exact heap-size-aligned
+    /// address is what makes the kernel build IOMMU mappings the
+    /// firmware accepts.
     pub fn map(&mut self) -> Result<&mut [u8]> {
         if self.mapping.is_none() {
-            let p = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    self.size,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    self.fd,
-                    self.map_offset as libc::off_t,
-                )
+            let p = if self.is_dev_heap {
+                self.mmap_dev_heap_aligned()?
+            } else {
+                let p = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        self.size,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED,
+                        self.fd,
+                        self.map_offset as libc::off_t,
+                    )
+                };
+                if p == libc::MAP_FAILED {
+                    return Err(XdnaError {
+                        code: std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                        message: format!(
+                            "mmap(handle={}, off={:#x}, size={}) failed",
+                            self.handle, self.map_offset, self.size
+                        ),
+                    });
+                }
+                // Lock the pages so PASID-based device access always
+                // hits resident pages. Best-effort — ignore EINVAL on
+                // file-backed mappings that don't support mlock.
+                unsafe { libc::mlock(p, self.size); }
+                p as *mut u8
             };
-            if p == libc::MAP_FAILED {
-                return Err(XdnaError {
-                    code: std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-                    message: format!(
-                        "mmap(handle={}, off={:#x}, size={}) failed",
-                        self.handle, self.map_offset, self.size
-                    ),
-                });
-            }
-            self.mapping = Some((NonNull::new(p as *mut u8).unwrap(), self.size));
+            self.mapping = Some((NonNull::new(p).unwrap(), self.size));
         }
         let (p, sz) = self.mapping.unwrap();
         Ok(unsafe { std::slice::from_raw_parts_mut(p.as_ptr(), sz) })
+    }
+
+    /// XRT-style aligned heap mmap: reserve 2×size as anonymous,
+    /// find the next size-aligned address inside, then MAP_FIXED
+    /// the device fd over it with MAP_LOCKED. The reservation
+    /// remainder gets implicitly trimmed when MAP_FIXED overlaps it.
+    fn mmap_dev_heap_aligned(&self) -> Result<*mut u8> {
+        let alignment = self.size; // = dev_mem_size = 64 MB
+        let reserve = self.size * 2;
+        let anon = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                reserve,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if anon == libc::MAP_FAILED {
+            return Err(XdnaError {
+                code: std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                message: format!("DEV_HEAP anon-reserve mmap({reserve}) failed"),
+            });
+        }
+        let base = anon as usize;
+        let aligned = (base + alignment - 1) & !(alignment - 1);
+
+        // Trim head/tail of reservation outside the aligned block.
+        if aligned > base {
+            unsafe { libc::munmap(base as *mut libc::c_void, aligned - base); }
+        }
+        let tail_start = aligned + self.size;
+        let tail_end = base + reserve;
+        if tail_end > tail_start {
+            unsafe {
+                libc::munmap(tail_start as *mut libc::c_void, tail_end - tail_start);
+            }
+        }
+
+        // MAP_FIXED the device fd over the aligned region.
+        let p = unsafe {
+            libc::mmap(
+                aligned as *mut libc::c_void,
+                self.size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_FIXED | libc::MAP_LOCKED,
+                self.fd,
+                self.map_offset as libc::off_t,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            return Err(XdnaError {
+                code: std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                message: format!(
+                    "DEV_HEAP MAP_FIXED|MAP_LOCKED mmap(addr={:#x}, off={:#x}, size={}) failed",
+                    aligned, self.map_offset, self.size
+                ),
+            });
+        }
+        Ok(p as *mut u8)
     }
 
     /// Direct access to this BO's mapped pointer (must call `map()`
