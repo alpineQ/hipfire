@@ -116,19 +116,34 @@ pub fn config_cus(fd: i32, ctx: &Hwctx, cu_bos: Vec<Bo>, cu_funcs: &[u8]) -> Res
 /// Submit one or more command BOs to a hwctx. Returns the firmware
 /// sequence number so the caller can correlate completion. The
 /// hwctx's syncobj will signal once all submitted commands complete.
+///
+/// Per the uapi: when there is exactly one cmd or one arg, the
+/// driver expects the handle value *itself* (cast to u64), not a
+/// pointer to a 1-element array.
 pub fn submit_exec_cmd(fd: i32, ctx: &Hwctx, cmd_bos: &[&Bo], arg_bos: &[&Bo]) -> Result<u64> {
-    let cmd_handles: Vec<u32> = cmd_bos.iter().map(|b| b.handle).collect();
-    let arg_handles: Vec<u32> = arg_bos.iter().map(|b| b.handle).collect();
+    let cmd_handles_vec: Vec<u32> = cmd_bos.iter().map(|b| b.handle).collect();
+    let arg_handles_vec: Vec<u32> = arg_bos.iter().map(|b| b.handle).collect();
+
+    let cmd_handles_field: u64 = match cmd_handles_vec.len() {
+        0 => 0,
+        1 => cmd_handles_vec[0] as u64,
+        _ => cmd_handles_vec.as_ptr() as u64,
+    };
+    let args_field: u64 = match arg_handles_vec.len() {
+        0 => 0,
+        1 => arg_handles_vec[0] as u64,
+        _ => arg_handles_vec.as_ptr() as u64,
+    };
 
     let mut req = DrmExecCmd {
         ext: 0,
         ext_flags: 0,
         hwctx: ctx.handle,
         ty: CMD_SUBMIT_EXEC_BUF,
-        cmd_handles: cmd_handles.as_ptr() as u64,
-        args: arg_handles.as_ptr() as u64,
-        cmd_count: cmd_handles.len() as u32,
-        arg_count: arg_handles.len() as u32,
+        cmd_handles: cmd_handles_field,
+        args: args_field,
+        cmd_count: cmd_handles_vec.len() as u32,
+        arg_count: arg_handles_vec.len() as u32,
         seq: 0,
     };
     let ret = unsafe {
@@ -147,8 +162,8 @@ pub fn submit_exec_cmd(fd: i32, ctx: &Hwctx, cmd_bos: &[&Bo], arg_bos: &[&Bo]) -
             message: format!(
                 "EXEC_CMD(hwctx={}, cmds={}, args={}) failed (errno={errno})",
                 ctx.handle,
-                cmd_handles.len(),
-                arg_handles.len()
+                cmd_handles_vec.len(),
+                arg_handles_vec.len()
             ),
         });
     }

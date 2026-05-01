@@ -50,6 +50,16 @@ impl Hipx {
         Bo::alloc_dev(self.device.fd, size)
     }
 
+    /// Get a host-visible mutable slice into a DEV BO via this
+    /// runtime's heap mapping. DEV BOs don't have their own
+    /// map_offset — they're sub-regions of the heap.
+    ///
+    /// # Safety
+    /// Caller asserts `bo` is a DEV BO from this runtime's heap.
+    pub unsafe fn dev_slice<'a>(&'a self, bo: &Bo) -> Result<&'a mut [u8]> {
+        bo.dev_slice_in_heap(&self.heap)
+    }
+
     /// Allocate a CMD BO for EXEC_CMD payloads.
     pub fn alloc_cmd(&self, size: usize) -> Result<Bo> {
         Bo::alloc_cmd(self.device.fd, size)

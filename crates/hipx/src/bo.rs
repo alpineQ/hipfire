@@ -152,6 +152,43 @@ impl Bo {
         Ok(unsafe { std::slice::from_raw_parts_mut(p.as_ptr(), sz) })
     }
 
+    /// Direct access to this BO's mapped pointer (must call `map()`
+    /// first). Returns None for unmapped BOs, including DEV BOs that
+    /// have no map_offset of their own — those are accessed through
+    /// their parent DEV_HEAP's mapping (see `dev_slice_in_heap`).
+    pub fn host_ptr(&self) -> Option<*mut u8> {
+        self.mapping.as_ref().map(|(p, _)| p.as_ptr())
+    }
+
+    /// For a DEV BO sub-allocated from a DEV_HEAP, return a slice
+    /// into the heap's mapped region pointing at this BO's data.
+    /// The heap must have been mapped (Hipx::open does this).
+    ///
+    /// # Safety
+    /// Caller asserts that `heap` is in fact this BO's parent DEV_HEAP.
+    pub unsafe fn dev_slice_in_heap<'a>(&self, heap: &'a Bo) -> Result<&'a mut [u8]> {
+        let heap_ptr = heap.host_ptr().ok_or_else(|| XdnaError {
+            code: 0,
+            message: "DEV_HEAP not mapped".to_string(),
+        })?;
+        if self.xdna_addr < heap.xdna_addr
+            || self.xdna_addr + self.size as u64 > heap.xdna_addr + heap.size as u64
+        {
+            return Err(XdnaError {
+                code: 0,
+                message: format!(
+                    "DEV BO xdna_addr={:#x}+{} not within heap xdna_addr={:#x}+{}",
+                    self.xdna_addr, self.size, heap.xdna_addr, heap.size
+                ),
+            });
+        }
+        let offset = (self.xdna_addr - heap.xdna_addr) as usize;
+        Ok(std::slice::from_raw_parts_mut(
+            heap_ptr.add(offset),
+            self.size,
+        ))
+    }
+
     /// SYNC_BO with the given direction (TO_DEVICE / FROM_DEVICE).
     pub fn sync(&self, direction: u32) -> Result<()> {
         let mut req = DrmSyncBo {
