@@ -72,6 +72,57 @@ fn run() {
             }
             Err(e) => println!("  FAIL: {e}"),
         }
+
+        // Real GEMM-class kernel: 288×288 i16 → i32 matvec.
+        println!("\n[hipfire-x] engine-API NPU dispatch (matvec_i16_288x288):");
+        let m = 288usize;
+        let k = 288usize;
+        let mut a = vec![0i16; m * k];
+        let mut b = vec![0i16; k];
+        for r in 0..m {
+            for kk in 0..k {
+                a[r * k + kk] = ((r + kk) as i16) & 0x7;
+            }
+        }
+        for kk in 0..k {
+            b[kk] = (kk as i16) & 0x7;
+        }
+        let mut c = vec![0i32; m];
+        let t0 = std::time::Instant::now();
+        match rt.matvec_i16_288x288(&a, &b, &mut c) {
+            Ok(()) => {
+                let first = std::time::Instant::now();
+                let warm_us = first.duration_since(t0).as_micros();
+                // verify
+                let mut errors = 0;
+                for r in 0..m {
+                    let mut want: i32 = 0;
+                    for kk in 0..k {
+                        want += a[r * k + kk] as i32 * b[kk] as i32;
+                    }
+                    if c[r] != want {
+                        errors += 1;
+                    }
+                }
+                if errors == 0 {
+                    // bench 50 dispatches steady-state
+                    let n = 50u32;
+                    let t = std::time::Instant::now();
+                    for _ in 0..n {
+                        rt.matvec_i16_288x288(&a, &b, &mut c).expect("matvec");
+                    }
+                    let mean_us = t.elapsed().as_micros() / n as u128;
+                    let macs = 2.0 * m as f64 * k as f64;
+                    let gops = macs / (mean_us as f64 / 1e6) / 1e9;
+                    println!(
+                        "  PASS — first {warm_us} us; warm mean {mean_us} us → {gops:.2} GOp/s ({n} iters, M=K={m})"
+                    );
+                } else {
+                    println!("  FAIL — {errors}/{m} matvec mismatches");
+                }
+            }
+            Err(e) => println!("  FAIL: {e}"),
+        }
     }
 }
 

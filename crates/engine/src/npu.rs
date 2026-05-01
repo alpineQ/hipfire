@@ -42,6 +42,28 @@ pub struct NpuRuntime {
     /// by `route()` to gate dispatch — a route to NPU is meaningless
     /// without a kernel for that op.
     available_ops: AvailableOps,
+    /// Lazily-initialized matvec kernel state — created on first call
+    /// to `matvec_i16()` and reused across subsequent dispatches.
+    /// Holds the bound CU, instruction stream, hwctx, and pre-built
+    /// cmd packet so steady-state dispatch is just BO refill + submit.
+    matvec_288: Option<Matvec288Kernel>,
+}
+
+/// Persistent state for the i16 288×288 matvec kernel. All BOs,
+/// the hwctx, the bound CU, and the cmd packet are allocated once
+/// and reused for every dispatch — the engine pays the ~1.5 ms
+/// first-call setup once, then every subsequent call is the bare
+/// dispatch latency (~530 µs steady-state at the time of writing).
+struct Matvec288Kernel {
+    ctx: hipx::hwctx::Hwctx,
+    _cu: hipx::cmd::CuBinding,
+    instr_bo: hipx::Bo,
+    a_bo: hipx::Bo,
+    b_bo: hipx::Bo,
+    c_bo: hipx::Bo,
+    bo3_bo: hipx::Bo,
+    bo4_bo: hipx::Bo,
+    cmd_bo: hipx::Bo,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -89,6 +111,7 @@ impl NpuRuntime {
             hipx,
             family,
             available_ops,
+            matvec_288: None,
         })
     }
 
@@ -234,5 +257,188 @@ impl NpuRuntime {
         let mut out = [0u8; 4096];
         out.copy_from_slice(&outp[..4096]);
         Ok(out)
+    }
+
+    /// 288×288 i16 → i32 GEMV. Lazily initializes the kernel on first
+    /// call (allocates BOs, binds CU, builds cmd packet); subsequent
+    /// calls just refill the input BOs and dispatch. `a` is M×K row-
+    /// major i16, `b` is K i16; the result is M i32 written into `c`.
+    ///
+    /// Returns Err on dispatch failure — the caller should fall back
+    /// to an iGPU/CPU GEMV path.
+    pub fn matvec_i16_288x288(
+        &mut self,
+        a: &[i16],
+        b: &[i16],
+        c: &mut [i32],
+    ) -> Result<(), hipx::XdnaError> {
+        use hipx::cmd::{config_cus, submit_exec_cmd};
+        use hipx::ert::{reset_state, ErtBuilder};
+        use hipx::fence::timeline_wait;
+        use hipx::hwctx::HwctxBuilder;
+        use hipx::ioctl::{SYNC_FROM_DEVICE, SYNC_TO_DEVICE};
+        use hipx::kernels::{
+            matvec_288x288_args as args, MATVEC_288X288_COLUMNS, MATVEC_288X288_INSTS,
+            MATVEC_288X288_K, MATVEC_288X288_M, MATVEC_288X288_OPS_PER_CYCLE, MATVEC_288X288_PDI,
+        };
+        use std::time::Duration;
+
+        let m = MATVEC_288X288_M;
+        let k = MATVEC_288X288_K;
+        if a.len() != m * k {
+            return Err(hipx::XdnaError {
+                code: 0,
+                message: format!("matvec a.len={} != {}", a.len(), m * k),
+            });
+        }
+        if b.len() != k {
+            return Err(hipx::XdnaError {
+                code: 0,
+                message: format!("matvec b.len={} != {k}", b.len()),
+            });
+        }
+        if c.len() != m {
+            return Err(hipx::XdnaError {
+                code: 0,
+                message: format!("matvec c.len={} != {m}", c.len()),
+            });
+        }
+
+        // Lazy first-call init.
+        if self.matvec_288.is_none() {
+            let mut hb = HwctxBuilder::default();
+            hb.num_columns = MATVEC_288X288_COLUMNS;
+            hb.max_opc = MATVEC_288X288_OPS_PER_CYCLE;
+            let ctx = self.hipx.create_hwctx(&hb)?;
+
+            let pdi_bo = self.hipx.alloc_dev(MATVEC_288X288_PDI.len())?;
+            unsafe {
+                let buf = self.hipx.dev_slice(&pdi_bo)?;
+                buf[..MATVEC_288X288_PDI.len()].copy_from_slice(MATVEC_288X288_PDI);
+            }
+            let _ = pdi_bo.sync(SYNC_TO_DEVICE);
+            let cu = config_cus(self.hipx.device.fd, &ctx, vec![pdi_bo], &[0u8])?;
+
+            let _pad = self.hipx.alloc_dev(32 * 1024)?;
+            std::mem::forget(_pad);
+
+            let instr_bo = self.hipx.alloc_dev(MATVEC_288X288_INSTS.len())?;
+            unsafe {
+                let buf = self.hipx.dev_slice(&instr_bo)?;
+                buf[..MATVEC_288X288_INSTS.len()].copy_from_slice(MATVEC_288X288_INSTS);
+            }
+            let _ = instr_bo.sync(SYNC_TO_DEVICE);
+            let ninstr_dwords = (MATVEC_288X288_INSTS.len() / 4) as u32;
+
+            let mut a_bo = self.hipx.alloc_shmem(m * k * 2)?;
+            let mut b_bo = self.hipx.alloc_shmem(k * 2)?;
+            let mut c_bo = self.hipx.alloc_shmem(m * 4)?;
+            let mut bo3_bo = hipx::Bo::alloc_shmem_exact(self.hipx.device.fd, 8)?;
+            let mut bo4_bo = hipx::Bo::alloc_shmem_exact(self.hipx.device.fd, 1)?;
+            // Populate host_ptr by mapping each BO once during init.
+            // Subsequent map() calls just return the cached address.
+            let _ = a_bo.map()?;
+            let _ = b_bo.map()?;
+            let _ = c_bo.map()?;
+            let _ = bo3_bo.map()?;
+            let _ = bo4_bo.map()?;
+
+            let a_va = a_bo.host_ptr().unwrap() as u64;
+            let b_va = b_bo.host_ptr().unwrap() as u64;
+            let c_va = c_bo.host_ptr().unwrap() as u64;
+            let bo3_va = bo3_bo.host_ptr().unwrap() as u64;
+            let bo4_va = bo4_bo.host_ptr().unwrap() as u64;
+
+            let mut cmd_bo = self.hipx.alloc_cmd(4096)?;
+            {
+                let cbuf = cmd_bo.map()?;
+                let mut eb = ErtBuilder::new_start_cu(&mut cbuf[..256]);
+                eb.set_cu_mask(0x1);
+                eb.set_arg_u64(args::OPCODE, 3);
+                eb.set_arg_u64(args::INSTR_PTR, instr_bo.xdna_addr);
+                eb.set_arg_u32(args::NINSTR, ninstr_dwords);
+                eb.set_arg_u64(args::A, a_va);
+                eb.set_arg_u64(args::B, b_va);
+                eb.set_arg_u64(args::C, c_va);
+                eb.set_arg_u64(args::BO3, bo3_va);
+                eb.set_arg_u64(args::BO4, bo4_va);
+                let _ = eb.finalize(0x3C);
+            }
+            let _ = cmd_bo.sync(SYNC_TO_DEVICE);
+
+            self.matvec_288 = Some(Matvec288Kernel {
+                ctx,
+                _cu: cu,
+                instr_bo,
+                a_bo,
+                b_bo,
+                c_bo,
+                bo3_bo,
+                bo4_bo,
+                cmd_bo,
+            });
+            self.available_ops.int8_gemm = true; // first GEMM-class kernel live
+        }
+
+        let kern = self.matvec_288.as_mut().unwrap();
+
+        // Refill A, B, reset C sentinel
+        {
+            let abuf = kern.a_bo.map()?;
+            for (i, &v) in a.iter().enumerate() {
+                abuf[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        let _ = kern.a_bo.sync(SYNC_TO_DEVICE);
+        {
+            let bbuf = kern.b_bo.map()?;
+            for (i, &v) in b.iter().enumerate() {
+                bbuf[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        let _ = kern.b_bo.sync(SYNC_TO_DEVICE);
+        {
+            let cbuf = kern.c_bo.map()?;
+            for byte in cbuf[..m * 4].iter_mut() {
+                *byte = 0;
+            }
+        }
+        let _ = kern.c_bo.sync(SYNC_TO_DEVICE);
+
+        // reset cmd packet state to NEW (firmware skips packets still
+        // marked COMPLETED from prior dispatch)
+        {
+            let cbuf = kern.cmd_bo.map()?;
+            reset_state(&mut cbuf[..4]);
+        }
+        let _ = kern.cmd_bo.sync(SYNC_TO_DEVICE);
+
+        let seq = submit_exec_cmd(
+            self.hipx.device.fd,
+            &kern.ctx,
+            &[&kern.cmd_bo],
+            &[
+                &kern.instr_bo,
+                &kern.a_bo,
+                &kern.b_bo,
+                &kern.c_bo,
+                &kern.bo3_bo,
+                &kern.bo4_bo,
+            ],
+        )?;
+        timeline_wait(
+            self.hipx.device.fd,
+            kern.ctx.syncobj_handle,
+            seq,
+            Duration::from_secs(5),
+        )?;
+
+        let _ = kern.c_bo.sync(SYNC_FROM_DEVICE);
+        let outp = kern.c_bo.map()?;
+        for (i, slot) in c.iter_mut().enumerate() {
+            let bytes: [u8; 4] = outp[i * 4..i * 4 + 4].try_into().unwrap();
+            *slot = i32::from_le_bytes(bytes);
+        }
+        Ok(())
     }
 }
