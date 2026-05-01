@@ -27,3 +27,7 @@ path = "src/bin/overview.rs"
 [[bin]]
 name = "hipx-passthrough"
 path = "src/bin/passthrough.rs"
+
+[[bin]]
+name = "hipx-vec-scalar-mul"
+path = "src/bin/vec_scalar_mul.rs"
