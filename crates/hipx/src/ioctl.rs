@@ -274,3 +274,120 @@ pub fn drm_ioctl_amdxdna_create_hwctx() -> libc::c_ulong {
 pub fn drm_ioctl_amdxdna_destroy_hwctx() -> libc::c_ulong {
     drm_iowr::<DrmDestroyHwctx>(NR_DESTROY_HWCTX)
 }
+
+// ─── HW context configuration (CU bind) ────────────────────────────────
+
+/// Param values for amdxdna_drm_config_hwctx.
+pub const HWCTX_CONFIG_CU: u32 = 0;
+pub const HWCTX_ASSIGN_DBG_BUF: u32 = 1;
+pub const HWCTX_REMOVE_DBG_BUF: u32 = 2;
+
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct DrmConfigHwctx {
+    pub handle: u32,
+    pub param_type: u32,
+    pub param_val: u64,
+    pub param_val_size: u32,
+    pub pad: u32,
+}
+
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct CuConfig {
+    pub cu_bo: u32,
+    pub cu_func: u8,
+    pub pad: [u8; 3],
+}
+
+/// Header for HwctxParamConfigCu — followed by `num_cus` CuConfig
+/// entries in the same buffer (max 4 KiB total per uapi note).
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct HwctxParamConfigCuHeader {
+    pub num_cus: u16,
+    pub pad: [u16; 3],
+}
+
+pub fn drm_ioctl_amdxdna_config_hwctx() -> libc::c_ulong {
+    drm_iowr::<DrmConfigHwctx>(NR_CONFIG_HWCTX)
+}
+
+// ─── Command execution ─────────────────────────────────────────────────
+
+pub const CMD_SUBMIT_EXEC_BUF: u32 = 0;
+pub const CMD_SUBMIT_DEPENDENCY: u32 = 1;
+pub const CMD_SUBMIT_SIGNAL: u32 = 2;
+
+pub const INVALID_CMD_HANDLE: u64 = u64::MAX;
+pub const INVALID_FENCE_HANDLE: u32 = 0;
+
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct DrmExecCmd {
+    pub ext: u64,
+    pub ext_flags: u64,
+    pub hwctx: u32,
+    pub ty: u32,
+    pub cmd_handles: u64,
+    pub args: u64,
+    pub cmd_count: u32,
+    pub arg_count: u32,
+    pub seq: u64,
+}
+
+pub fn drm_ioctl_amdxdna_exec_cmd() -> libc::c_ulong {
+    drm_iowr::<DrmExecCmd>(NR_EXEC_CMD)
+}
+
+// ─── State (power mode, AIE mem/reg writes, preempt) ───────────────────
+
+pub const SET_POWER_MODE: u32 = 0;
+pub const WRITE_AIE_MEM: u32 = 1;
+pub const WRITE_AIE_REG: u32 = 2;
+pub const SET_FORCE_PREEMPT: u32 = 3;
+pub const SET_FRAME_BOUNDARY_PREEMPT: u32 = 4;
+
+pub const POWER_MODE_DEFAULT: u8 = 0;
+pub const POWER_MODE_LOW: u8 = 1;
+pub const POWER_MODE_MEDIUM: u8 = 2;
+pub const POWER_MODE_HIGH: u8 = 3;
+pub const POWER_MODE_TURBO: u8 = 4;
+
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct DrmSetState {
+    pub param: u32,
+    pub buffer_size: u32,
+    pub buffer: u64,
+}
+
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct SetPowerMode {
+    pub power_mode: u8,
+    pub pad: [u8; 7],
+}
+
+pub fn drm_ioctl_amdxdna_set_state() -> libc::c_ulong {
+    drm_iowr::<DrmSetState>(NR_SET_STATE)
+}
+
+// ─── Bulk array queries (active hwctxs, async errors) ──────────────────
+
+pub const HW_CONTEXT_ALL: u32 = 0;
+pub const HW_LAST_ASYNC_ERR: u32 = 2;
+
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct DrmGetArray {
+    pub param: u32,
+    pub element_size: u32,
+    pub num_element: u32,
+    pub pad: u32,
+    pub buffer: u64,
+}
+
+pub fn drm_ioctl_amdxdna_get_array() -> libc::c_ulong {
+    drm_iowr::<DrmGetArray>(NR_GET_ARRAY)
+}

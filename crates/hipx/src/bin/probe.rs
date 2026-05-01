@@ -3,7 +3,7 @@
 //! ioctl error.
 
 use std::process::ExitCode;
-use xdna_compute::device::Device;
+use hipx::device::Device;
 
 fn clock_name(name: &[u8; 16]) -> String {
     let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
@@ -19,7 +19,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    println!("[xdna-probe] opened device fd={}", dev.fd);
+    println!("[hipx-probe] opened device fd={}", dev.fd);
 
     match dev.query_aie_version() {
         Ok(v) => println!("AIE version:      {}.{}", v.major, v.minor),

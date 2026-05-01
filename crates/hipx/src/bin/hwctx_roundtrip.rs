@@ -5,9 +5,9 @@
 //! and sweep only (num_columns, max_opc, log_buf) for hwctx.
 
 use std::process::ExitCode;
-use xdna_compute::bo::Bo;
-use xdna_compute::device::Device;
-use xdna_compute::hwctx::{Hwctx, HwctxBuilder};
+use hipx::bo::Bo;
+use hipx::device::Device;
+use hipx::hwctx::{Hwctx, HwctxBuilder};
 
 fn main() -> ExitCode {
     let dev = match Device::open(None) {

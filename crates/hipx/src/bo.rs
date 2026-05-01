@@ -10,20 +10,38 @@ use crate::{Result, XdnaError};
 use std::ptr::NonNull;
 
 /// A buffer object owned by an amdxdna device. Drop frees + unmaps.
-pub struct Bo<'dev> {
+///
+/// Caller is responsible for keeping the device fd alive for the
+/// BO's lifetime — that's a `Hipx` (or `Device`) outliving its BOs.
+pub struct Bo {
     fd: i32,
     pub handle: u32,
     pub size: usize,
     pub xdna_addr: u64,
     map_offset: u64,
     mapping: Option<(NonNull<u8>, usize)>,
-    _marker: std::marker::PhantomData<&'dev ()>,
 }
 
-impl<'dev> Bo<'dev> {
+impl Bo {
     /// Allocate a SHMEM BO of the requested size. Page-aligns up.
+    /// SHMEM = host-pinned pages, visible to NPU via IOMMU. Use for
+    /// activation tensors, tokens, anything we want to mmap.
     pub fn alloc_shmem(fd: i32, size: usize) -> Result<Self> {
         Self::alloc_typed(fd, size, BO_SHMEM)
+    }
+
+    /// Allocate a DEV BO sub-allocated from the per-client DEV_HEAP.
+    /// DEV BOs live in the heap region and are addressable by the NPU
+    /// via the device VA returned in `xdna_addr`. Use for inputs the
+    /// NPU reads via DMA without going through host-pinned pages.
+    pub fn alloc_dev(fd: i32, size: usize) -> Result<Self> {
+        Self::alloc_typed(fd, size, BO_DEV)
+    }
+
+    /// Allocate a CMD BO. CMD BOs are descriptor packets passed to
+    /// EXEC_CMD; the firmware reads them to know what to launch.
+    pub fn alloc_cmd(fd: i32, size: usize) -> Result<Self> {
+        Self::alloc_typed(fd, size, BO_CMD)
     }
 
     /// Allocate a per-client DEV_HEAP BO. Required before CREATE_HWCTX.
@@ -103,7 +121,6 @@ impl<'dev> Bo<'dev> {
             xdna_addr: info.xdna_addr,
             map_offset: info.map_offset,
             mapping: None,
-            _marker: std::marker::PhantomData,
         })
     }
 
@@ -163,7 +180,7 @@ impl<'dev> Bo<'dev> {
     }
 }
 
-impl<'dev> Drop for Bo<'dev> {
+impl Drop for Bo {
     fn drop(&mut self) {
         if let Some((p, sz)) = self.mapping.take() {
             unsafe {

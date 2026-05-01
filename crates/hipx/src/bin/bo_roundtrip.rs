@@ -6,9 +6,9 @@
 //! into the device VA space.
 
 use std::process::ExitCode;
-use xdna_compute::bo::Bo;
-use xdna_compute::device::Device;
-use xdna_compute::ioctl::{SYNC_FROM_DEVICE, SYNC_TO_DEVICE};
+use hipx::bo::Bo;
+use hipx::device::Device;
+use hipx::ioctl::{SYNC_FROM_DEVICE, SYNC_TO_DEVICE};
 
 const SIZE: usize = 64 * 1024;
 const MAGIC: u32 = 0xCAFEF00D;
@@ -59,15 +59,15 @@ fn main() -> ExitCode {
         }
     }
 
-    // SYNC_BO FROM_DEVICE on SHMEM is rejected by the driver (EINVAL =
-    // 22): SHMEM is host-pinned, the device writes through IOMMU into
-    // the same pages we mmap'd, so there's no device-side copy to
-    // fetch back. We log the expected EINVAL but keep going; for
-    // DEV/DEV_HEAP BOs (later phases) this call will be required.
+    // SYNC_BO FROM_DEVICE behaviour differs by driver:
+    //   in-tree (Ubuntu 7.0 amdxdna v0.7.0): rejects EINVAL on SHMEM
+    //   OOT amd/xdna-driver (DKMS v1.0.0+):  accepts as no-op
+    // Either is correct — SHMEM is host-pinned, no device-side copy
+    // to fetch back on x86 cache-coherent. Both outcomes pass.
     match bo.sync(SYNC_FROM_DEVICE) {
-        Ok(()) => println!("[bo] SYNC_BO FROM_DEVICE ok (unexpected — note for phase 2)"),
+        Ok(()) => println!("[bo] SYNC_BO FROM_DEVICE ok"),
         Err(e) if e.code == 22 => {
-            println!("[bo] SYNC_BO FROM_DEVICE rejected (EINVAL) — expected for SHMEM");
+            println!("[bo] SYNC_BO FROM_DEVICE rejected (EINVAL) — in-tree driver behaviour");
         }
         Err(e) => {
             eprintln!("SYNC FROM_DEVICE: {e}");
