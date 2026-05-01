@@ -22,15 +22,15 @@ Bring-up tier:
 
 Performance tier:
 
-| Kernel              | Shape          | Standalone        | Engine API       |
-|---------------------|----------------|-------------------|------------------|
-| `matvec`            | 288×288 i16    | 0.31 GOp/s         | 0.30 GOp/s zero-copy |
-| `matmul-512`        | 512^3 i16      | **1.04 TOp/s**     | 0.43 TOp/s        |
-| `matmul-i8`         | 512^3 i8       | **1.97 TOp/s**     | 1.04 TOp/s zero-copy |
-| `matmul-i8-1024`    | 1024^3 i8      | **4.46 TOp/s**     | 2.13 TOp/s zero-copy |
-| `matmul-i8-2048`    | 2048^3 i8      | 4.36 TOp/s         | —                 |
-| `matmul-bf16`       | 512^3 bf16     | 0.83 TOp/s         | —                 |
-| `matmul-bf16-1024`  | 1024^3 bf16    | **0.97 TOp/s**     | —                 |
+| Kernel              | Shape          | Standalone        | Engine API zero-copy |
+|---------------------|----------------|-------------------|----------------------|
+| `matvec`            | 288×288 i16    | 0.31 GOp/s         | 0.30 GOp/s            |
+| `matmul-512`        | 512^3 i16      | **1.04 TOp/s**     | 0.43 TOp/s            |
+| `matmul-i8`         | 512^3 i8       | **1.97 TOp/s**     | 1.10 TOp/s            |
+| `matmul-i8-1024`    | 1024^3 i8      | **4.46 TOp/s**     | 2.23 TOp/s            |
+| `matmul-i8-2048`    | 2048^3 i8      | 4.36 TOp/s         | (no engine API)       |
+| `matmul-bf16`       | 512^3 bf16     | 0.83 TOp/s         | (no engine API)       |
+| `matmul-bf16-1024`  | 1024^3 bf16    | **0.97 TOp/s**     | **1.03 TOp/s**        |
 
 The 4.46 TOp/s INT8 figure is sustained — 50 iterations, 482 µs mean
 dispatch, 2.1 GMACs per call. Strix Halo NPU peak is ~50 TOPS INT8,
