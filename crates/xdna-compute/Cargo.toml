@@ -11,3 +11,11 @@ libc = "0.2"
 [[bin]]
 name = "xdna-probe"
 path = "src/bin/probe.rs"
+
+[[bin]]
+name = "xdna-bo-roundtrip"
+path = "src/bin/bo_roundtrip.rs"
+
+[[bin]]
+name = "xdna-hwctx-roundtrip"
+path = "src/bin/hwctx_roundtrip.rs"
