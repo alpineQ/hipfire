@@ -54,6 +54,10 @@ pub struct NpuRuntime {
     matmul_i8_512: Option<MatmulI8512Kernel>,
     /// 1024×1024×1024 INT8 — 8× the MAC volume, 4.5 TOp/s sustained.
     matmul_i8_1024: Option<MatmulI81024Kernel>,
+    /// 512×512×512 BF16 — natural-precision LLM kernel, 0.83 TOp/s.
+    matmul_bf16_512: Option<MatmulBf16512Kernel>,
+    /// 1024×1024×1024 BF16 — 0.97 TOp/s sustained.
+    matmul_bf16_1024: Option<MatmulBf161024Kernel>,
 }
 
 /// Persistent state for the i16 288×288 matvec kernel. All BOs,
@@ -114,6 +118,32 @@ struct MatmulI81024Kernel {
     cmd_bo: hipx::Bo,
 }
 
+/// Persistent state for the BF16 512×512×512 4-core matmul kernel.
+struct MatmulBf16512Kernel {
+    ctx: hipx::hwctx::Hwctx,
+    _cu: hipx::cmd::CuBinding,
+    instr_bo: hipx::Bo,
+    a_bo: hipx::Bo,
+    b_bo: hipx::Bo,
+    c_bo: hipx::Bo,
+    bo3_bo: hipx::Bo,
+    bo4_bo: hipx::Bo,
+    cmd_bo: hipx::Bo,
+}
+
+/// Persistent state for the BF16 1024×1024×1024 4-core matmul kernel.
+struct MatmulBf161024Kernel {
+    ctx: hipx::hwctx::Hwctx,
+    _cu: hipx::cmd::CuBinding,
+    instr_bo: hipx::Bo,
+    a_bo: hipx::Bo,
+    b_bo: hipx::Bo,
+    c_bo: hipx::Bo,
+    bo3_bo: hipx::Bo,
+    bo4_bo: hipx::Bo,
+    cmd_bo: hipx::Bo,
+}
+
 #[derive(Default, Debug, Clone, Copy)]
 pub struct AvailableOps {
     /// 4 KiB byte passthrough (proved end-to-end via hipx-passthrough).
@@ -163,6 +193,8 @@ impl NpuRuntime {
             matmul_512: None,
             matmul_i8_512: None,
             matmul_i8_1024: None,
+            matmul_bf16_512: None,
+            matmul_bf16_1024: None,
         })
     }
 
@@ -1342,6 +1374,340 @@ impl NpuRuntime {
         for (i, slot) in c.iter_mut().enumerate() {
             let bytes: [u8; 4] = outp[i * 4..i * 4 + 4].try_into().unwrap();
             *slot = i32::from_le_bytes(bytes);
+        }
+        Ok(())
+    }
+
+    /// 512×512×512 BF16 matmul. Inputs are f32 (auto-converted to bf16
+    /// via `>>16` round-toward-zero); output is f32. Use when the
+    /// caller already has fp32 data; for pre-bf16'd inputs see the
+    /// raw variant (TODO: add when needed).
+    ///
+    /// 0.83 TOp/s sustained on AIE-2P. The natural-precision shape for
+    /// LLM attention scoring (Q · K^T) and hidden-state projections.
+    pub fn matmul_bf16_512_4c(
+        &mut self,
+        a: &[f32],
+        b: &[f32],
+        c: &mut [f32],
+    ) -> Result<(), hipx::XdnaError> {
+        use hipx::cmd::{config_cus, submit_exec_cmd};
+        use hipx::ert::{reset_state, ErtBuilder};
+        use hipx::fence::timeline_wait;
+        use hipx::hwctx::HwctxBuilder;
+        use hipx::ioctl::{SYNC_FROM_DEVICE, SYNC_TO_DEVICE};
+        use hipx::kernels::{
+            matmul_bf16_512_4c_args as args, MATMUL_BF16_512_4C_COLUMNS,
+            MATMUL_BF16_512_4C_INSTS, MATMUL_BF16_512_4C_K, MATMUL_BF16_512_4C_M,
+            MATMUL_BF16_512_4C_N, MATMUL_BF16_512_4C_OPS_PER_CYCLE,
+            MATMUL_BF16_512_4C_PDI,
+        };
+        use std::time::Duration;
+
+        let m = MATMUL_BF16_512_4C_M;
+        let k = MATMUL_BF16_512_4C_K;
+        let n = MATMUL_BF16_512_4C_N;
+        if a.len() != m * k || b.len() != k * n || c.len() != m * n {
+            return Err(hipx::XdnaError {
+                code: 0,
+                message: format!(
+                    "matmul_bf16_512 shape mismatch: a={} b={} c={} (need {}/{}/{})",
+                    a.len(), b.len(), c.len(), m * k, k * n, m * n
+                ),
+            });
+        }
+
+        if self.matmul_bf16_512.is_none() {
+            let mut hb = HwctxBuilder::default();
+            hb.num_columns = MATMUL_BF16_512_4C_COLUMNS;
+            hb.max_opc = MATMUL_BF16_512_4C_OPS_PER_CYCLE;
+            let ctx = self.hipx.create_hwctx(&hb)?;
+
+            let pdi_bo = self.hipx.alloc_dev(MATMUL_BF16_512_4C_PDI.len())?;
+            unsafe {
+                let buf = self.hipx.dev_slice(&pdi_bo)?;
+                buf[..MATMUL_BF16_512_4C_PDI.len()].copy_from_slice(MATMUL_BF16_512_4C_PDI);
+            }
+            let _ = pdi_bo.sync(SYNC_TO_DEVICE);
+            let cu = config_cus(self.hipx.device.fd, &ctx, vec![pdi_bo], &[0u8])?;
+
+            let instr_bo = self.hipx.alloc_dev(MATMUL_BF16_512_4C_INSTS.len())?;
+            unsafe {
+                let buf = self.hipx.dev_slice(&instr_bo)?;
+                buf[..MATMUL_BF16_512_4C_INSTS.len()].copy_from_slice(MATMUL_BF16_512_4C_INSTS);
+            }
+            let _ = instr_bo.sync(SYNC_TO_DEVICE);
+            let ninstr_dwords = (MATMUL_BF16_512_4C_INSTS.len() / 4) as u32;
+
+            let mut a_bo = self.hipx.alloc_shmem(m * k * 2)?;
+            let mut b_bo = self.hipx.alloc_shmem(k * n * 2)?;
+            let mut c_bo = self.hipx.alloc_shmem(m * n * 4)?;
+            let mut bo3_bo = hipx::Bo::alloc_shmem_exact(self.hipx.device.fd, 1)?;
+            let mut bo4_bo = hipx::Bo::alloc_shmem_exact(self.hipx.device.fd, 4)?;
+            let _ = a_bo.map()?;
+            let _ = b_bo.map()?;
+            let _ = c_bo.map()?;
+            let _ = bo3_bo.map()?;
+            let _ = bo4_bo.map()?;
+
+            let a_va = a_bo.host_ptr().unwrap() as u64;
+            let b_va = b_bo.host_ptr().unwrap() as u64;
+            let c_va = c_bo.host_ptr().unwrap() as u64;
+            let bo3_va = bo3_bo.host_ptr().unwrap() as u64;
+            let bo4_va = bo4_bo.host_ptr().unwrap() as u64;
+
+            let mut cmd_bo = self.hipx.alloc_cmd(4096)?;
+            {
+                let cbuf = cmd_bo.map()?;
+                let mut eb = ErtBuilder::new_start_cu(&mut cbuf[..256]);
+                eb.set_cu_mask(0x1);
+                eb.set_arg_u64(args::OPCODE, 3);
+                eb.set_arg_u64(args::INSTR_PTR, instr_bo.xdna_addr);
+                eb.set_arg_u32(args::NINSTR, ninstr_dwords);
+                eb.set_arg_u64(args::A, a_va);
+                eb.set_arg_u64(args::B, b_va);
+                eb.set_arg_u64(args::C, c_va);
+                eb.set_arg_u64(args::BO3, bo3_va);
+                eb.set_arg_u64(args::BO4, bo4_va);
+                let _ = eb.finalize(0x3C);
+            }
+            let _ = cmd_bo.sync(SYNC_TO_DEVICE);
+
+            self.matmul_bf16_512 = Some(MatmulBf16512Kernel {
+                ctx,
+                _cu: cu,
+                instr_bo,
+                a_bo,
+                b_bo,
+                c_bo,
+                bo3_bo,
+                bo4_bo,
+                cmd_bo,
+            });
+        }
+
+        let kern = self.matmul_bf16_512.as_mut().unwrap();
+
+        // f32 → bf16 (truncate the low 16 bits — round-toward-zero,
+        // sufficient for inference precision).
+        {
+            let abuf = kern.a_bo.map()?;
+            for (i, &v) in a.iter().enumerate() {
+                let bf = (v.to_bits() >> 16) as u16;
+                abuf[i * 2..i * 2 + 2].copy_from_slice(&bf.to_le_bytes());
+            }
+        }
+        let _ = kern.a_bo.sync(SYNC_TO_DEVICE);
+        {
+            let bbuf = kern.b_bo.map()?;
+            for (i, &v) in b.iter().enumerate() {
+                let bf = (v.to_bits() >> 16) as u16;
+                bbuf[i * 2..i * 2 + 2].copy_from_slice(&bf.to_le_bytes());
+            }
+        }
+        let _ = kern.b_bo.sync(SYNC_TO_DEVICE);
+        {
+            let cbuf = kern.c_bo.map()?;
+            for byte in cbuf[..m * n * 4].iter_mut() {
+                *byte = 0;
+            }
+        }
+        let _ = kern.c_bo.sync(SYNC_TO_DEVICE);
+
+        {
+            let cbuf = kern.cmd_bo.map()?;
+            reset_state(&mut cbuf[..4]);
+        }
+        let _ = kern.cmd_bo.sync(SYNC_TO_DEVICE);
+
+        let seq = submit_exec_cmd(
+            self.hipx.device.fd,
+            &kern.ctx,
+            &[&kern.cmd_bo],
+            &[
+                &kern.instr_bo,
+                &kern.a_bo,
+                &kern.b_bo,
+                &kern.c_bo,
+                &kern.bo3_bo,
+                &kern.bo4_bo,
+            ],
+        )?;
+        timeline_wait(
+            self.hipx.device.fd,
+            kern.ctx.syncobj_handle,
+            seq,
+            Duration::from_secs(10),
+        )?;
+
+        let _ = kern.c_bo.sync(SYNC_FROM_DEVICE);
+        let outp = kern.c_bo.map()?;
+        for (i, slot) in c.iter_mut().enumerate() {
+            let bytes: [u8; 4] = outp[i * 4..i * 4 + 4].try_into().unwrap();
+            *slot = f32::from_le_bytes(bytes);
+        }
+        Ok(())
+    }
+
+    /// 1024×1024×1024 BF16 matmul. 0.97 TOp/s sustained.
+    pub fn matmul_bf16_1024_4c(
+        &mut self,
+        a: &[f32],
+        b: &[f32],
+        c: &mut [f32],
+    ) -> Result<(), hipx::XdnaError> {
+        use hipx::cmd::{config_cus, submit_exec_cmd};
+        use hipx::ert::{reset_state, ErtBuilder};
+        use hipx::fence::timeline_wait;
+        use hipx::hwctx::HwctxBuilder;
+        use hipx::ioctl::{SYNC_FROM_DEVICE, SYNC_TO_DEVICE};
+        use hipx::kernels::{
+            matmul_bf16_1024_4c_args as args, MATMUL_BF16_1024_4C_COLUMNS,
+            MATMUL_BF16_1024_4C_INSTS, MATMUL_BF16_1024_4C_K, MATMUL_BF16_1024_4C_M,
+            MATMUL_BF16_1024_4C_N, MATMUL_BF16_1024_4C_OPS_PER_CYCLE,
+            MATMUL_BF16_1024_4C_PDI,
+        };
+        use std::time::Duration;
+
+        let m = MATMUL_BF16_1024_4C_M;
+        let k = MATMUL_BF16_1024_4C_K;
+        let n = MATMUL_BF16_1024_4C_N;
+        if a.len() != m * k || b.len() != k * n || c.len() != m * n {
+            return Err(hipx::XdnaError {
+                code: 0,
+                message: format!(
+                    "matmul_bf16_1024 shape mismatch: a={} b={} c={} (need {}/{}/{})",
+                    a.len(), b.len(), c.len(), m * k, k * n, m * n
+                ),
+            });
+        }
+
+        if self.matmul_bf16_1024.is_none() {
+            let mut hb = HwctxBuilder::default();
+            hb.num_columns = MATMUL_BF16_1024_4C_COLUMNS;
+            hb.max_opc = MATMUL_BF16_1024_4C_OPS_PER_CYCLE;
+            let ctx = self.hipx.create_hwctx(&hb)?;
+
+            let pdi_bo = self.hipx.alloc_dev(MATMUL_BF16_1024_4C_PDI.len())?;
+            unsafe {
+                let buf = self.hipx.dev_slice(&pdi_bo)?;
+                buf[..MATMUL_BF16_1024_4C_PDI.len()].copy_from_slice(MATMUL_BF16_1024_4C_PDI);
+            }
+            let _ = pdi_bo.sync(SYNC_TO_DEVICE);
+            let cu = config_cus(self.hipx.device.fd, &ctx, vec![pdi_bo], &[0u8])?;
+
+            let instr_bo = self.hipx.alloc_dev(MATMUL_BF16_1024_4C_INSTS.len())?;
+            unsafe {
+                let buf = self.hipx.dev_slice(&instr_bo)?;
+                buf[..MATMUL_BF16_1024_4C_INSTS.len()].copy_from_slice(MATMUL_BF16_1024_4C_INSTS);
+            }
+            let _ = instr_bo.sync(SYNC_TO_DEVICE);
+            let ninstr_dwords = (MATMUL_BF16_1024_4C_INSTS.len() / 4) as u32;
+
+            let mut a_bo = self.hipx.alloc_shmem(m * k * 2)?;
+            let mut b_bo = self.hipx.alloc_shmem(k * n * 2)?;
+            let mut c_bo = self.hipx.alloc_shmem(m * n * 4)?;
+            let mut bo3_bo = hipx::Bo::alloc_shmem_exact(self.hipx.device.fd, 1)?;
+            let mut bo4_bo = hipx::Bo::alloc_shmem_exact(self.hipx.device.fd, 4)?;
+            let _ = a_bo.map()?;
+            let _ = b_bo.map()?;
+            let _ = c_bo.map()?;
+            let _ = bo3_bo.map()?;
+            let _ = bo4_bo.map()?;
+
+            let a_va = a_bo.host_ptr().unwrap() as u64;
+            let b_va = b_bo.host_ptr().unwrap() as u64;
+            let c_va = c_bo.host_ptr().unwrap() as u64;
+            let bo3_va = bo3_bo.host_ptr().unwrap() as u64;
+            let bo4_va = bo4_bo.host_ptr().unwrap() as u64;
+
+            let mut cmd_bo = self.hipx.alloc_cmd(4096)?;
+            {
+                let cbuf = cmd_bo.map()?;
+                let mut eb = ErtBuilder::new_start_cu(&mut cbuf[..256]);
+                eb.set_cu_mask(0x1);
+                eb.set_arg_u64(args::OPCODE, 3);
+                eb.set_arg_u64(args::INSTR_PTR, instr_bo.xdna_addr);
+                eb.set_arg_u32(args::NINSTR, ninstr_dwords);
+                eb.set_arg_u64(args::A, a_va);
+                eb.set_arg_u64(args::B, b_va);
+                eb.set_arg_u64(args::C, c_va);
+                eb.set_arg_u64(args::BO3, bo3_va);
+                eb.set_arg_u64(args::BO4, bo4_va);
+                let _ = eb.finalize(0x3C);
+            }
+            let _ = cmd_bo.sync(SYNC_TO_DEVICE);
+
+            self.matmul_bf16_1024 = Some(MatmulBf161024Kernel {
+                ctx,
+                _cu: cu,
+                instr_bo,
+                a_bo,
+                b_bo,
+                c_bo,
+                bo3_bo,
+                bo4_bo,
+                cmd_bo,
+            });
+        }
+
+        let kern = self.matmul_bf16_1024.as_mut().unwrap();
+
+        {
+            let abuf = kern.a_bo.map()?;
+            for (i, &v) in a.iter().enumerate() {
+                let bf = (v.to_bits() >> 16) as u16;
+                abuf[i * 2..i * 2 + 2].copy_from_slice(&bf.to_le_bytes());
+            }
+        }
+        let _ = kern.a_bo.sync(SYNC_TO_DEVICE);
+        {
+            let bbuf = kern.b_bo.map()?;
+            for (i, &v) in b.iter().enumerate() {
+                let bf = (v.to_bits() >> 16) as u16;
+                bbuf[i * 2..i * 2 + 2].copy_from_slice(&bf.to_le_bytes());
+            }
+        }
+        let _ = kern.b_bo.sync(SYNC_TO_DEVICE);
+        {
+            let cbuf = kern.c_bo.map()?;
+            for byte in cbuf[..m * n * 4].iter_mut() {
+                *byte = 0;
+            }
+        }
+        let _ = kern.c_bo.sync(SYNC_TO_DEVICE);
+
+        {
+            let cbuf = kern.cmd_bo.map()?;
+            reset_state(&mut cbuf[..4]);
+        }
+        let _ = kern.cmd_bo.sync(SYNC_TO_DEVICE);
+
+        let seq = submit_exec_cmd(
+            self.hipx.device.fd,
+            &kern.ctx,
+            &[&kern.cmd_bo],
+            &[
+                &kern.instr_bo,
+                &kern.a_bo,
+                &kern.b_bo,
+                &kern.c_bo,
+                &kern.bo3_bo,
+                &kern.bo4_bo,
+            ],
+        )?;
+        timeline_wait(
+            self.hipx.device.fd,
+            kern.ctx.syncobj_handle,
+            seq,
+            Duration::from_secs(20),
+        )?;
+
+        let _ = kern.c_bo.sync(SYNC_FROM_DEVICE);
+        let outp = kern.c_bo.map()?;
+        for (i, slot) in c.iter_mut().enumerate() {
+            let bytes: [u8; 4] = outp[i * 4..i * 4 + 4].try_into().unwrap();
+            *slot = f32::from_le_bytes(bytes);
         }
         Ok(())
     }
