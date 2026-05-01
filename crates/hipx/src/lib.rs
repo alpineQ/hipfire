@@ -38,6 +38,9 @@ pub mod hwctx;
 pub mod runtime;
 pub mod dispatch;
 pub mod kernels;
+pub mod cmd;
+pub mod fence;
+pub mod prime;
 
 #[derive(Debug)]
 pub struct XdnaError {
