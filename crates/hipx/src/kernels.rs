@@ -238,3 +238,26 @@ pub mod matmul_bf16_512_4c_args {
     pub const B: usize = BO1;     // 524 288 B   (K*N*bf16)
     pub const C: usize = BO2;     // 1 048 576 B (M*N*f32)
 }
+
+/// 4-core whole-array bf16×bf16→f32 matmul, M=K=N=1024, tile 32×32×32.
+/// 8× more MACs than the 512^3 BF16 — moves the dispatch overhead
+/// fraction from ~50% to ~10%, approaching the per-shape ceiling.
+pub const MATMUL_BF16_1024_4C_PDI: &[u8] =
+    include_bytes!("../../../kernels/aie2p/matmul_bf16_1024_4c/build/main.pdi");
+
+pub const MATMUL_BF16_1024_4C_INSTS: &[u8] =
+    include_bytes!("../../../kernels/aie2p/matmul_bf16_1024_4c/build/insts.bin");
+
+pub const MATMUL_BF16_1024_4C_KERNEL_ID: u32 = 0x901;
+pub const MATMUL_BF16_1024_4C_OPS_PER_CYCLE: u32 = 2048;
+pub const MATMUL_BF16_1024_4C_COLUMNS: u32 = 8;
+pub const MATMUL_BF16_1024_4C_M: usize = 1024;
+pub const MATMUL_BF16_1024_4C_K: usize = 1024;
+pub const MATMUL_BF16_1024_4C_N: usize = 1024;
+
+pub mod matmul_bf16_1024_4c_args {
+    pub use super::passthrough_4k_args::*;
+    pub const A: usize = BO0;     // 2 097 152 B   (M*K*bf16)
+    pub const B: usize = BO1;     // 2 097 152 B   (K*N*bf16)
+    pub const C: usize = BO2;     // 4 194 304 B   (M*N*f32)
+}
