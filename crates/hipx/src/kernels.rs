@@ -190,3 +190,27 @@ pub mod matmul_i8_1024_4c_args {
     pub const B: usize = BO1;     // 1 048 576 B  (K*N*i8)
     pub const C: usize = BO2;     // 4 194 304 B  (M*N*i32)
 }
+
+/// 4-core whole-array i8×i8→i32 matmul, M=K=N=2048, tile m=k=n=64.
+/// 8× more MACs than MATMUL_I8_1024_4C (17 GMACs vs 2.1), so the
+/// dispatch overhead amortizes further — useful as the fully-saturating
+/// shape for steady-state perf measurement.
+pub const MATMUL_I8_2048_4C_PDI: &[u8] =
+    include_bytes!("../../../kernels/aie2p/matmul_i8_2048_4c/build/main.pdi");
+
+pub const MATMUL_I8_2048_4C_INSTS: &[u8] =
+    include_bytes!("../../../kernels/aie2p/matmul_i8_2048_4c/build/insts.bin");
+
+pub const MATMUL_I8_2048_4C_KERNEL_ID: u32 = 0x901;
+pub const MATMUL_I8_2048_4C_OPS_PER_CYCLE: u32 = 2048;
+pub const MATMUL_I8_2048_4C_COLUMNS: u32 = 8;
+pub const MATMUL_I8_2048_4C_M: usize = 2048;
+pub const MATMUL_I8_2048_4C_K: usize = 2048;
+pub const MATMUL_I8_2048_4C_N: usize = 2048;
+
+pub mod matmul_i8_2048_4c_args {
+    pub use super::passthrough_4k_args::*;
+    pub const A: usize = BO0;     // 4 194 304 B   (M*K*i8)
+    pub const B: usize = BO1;     // 4 194 304 B   (K*N*i8)
+    pub const C: usize = BO2;     // 16 777 216 B  (M*N*i32 = 16 MiB)
+}
