@@ -90,3 +90,33 @@ pub mod passthrough_dmas_args {
     pub const UNUSED1: usize = BO1;   // unused (rt.sequence has _ placeholder)
     pub const OUTPUT: usize = BO2;    // 16384 B = 4096 × i32
 }
+
+/// matrix_vector i16xi16→i32 GEMV — third compute proof kernel.
+/// Computes c = A · b where A is M×K i16, b is K i16, c is M i32.
+/// M=K=288, N=1, tile m=k=32. Full 8-column partition. This is the
+/// first "real GEMM-class" kernel and the building block for both
+/// INT8 spec-decode draft heads and the asym KV-codec dequant fold.
+///
+/// Per the kernels.json manifest, the layout is:
+/// - bo0 = A matrix (M*K*sizeof(i16) = 288*288*2 = 165 888 B)
+/// - bo1 = b vector (K*sizeof(i16) = 576 B)
+/// - bo2 = c output (M*sizeof(i32) = 1152 B)
+/// - bo3, bo4 = ctrlpkts/trace placeholders
+pub const MATVEC_288X288_PDI: &[u8] =
+    include_bytes!("../../../kernels/aie2p/matvec_288x288x1/build/main.pdi");
+
+pub const MATVEC_288X288_INSTS: &[u8] =
+    include_bytes!("../../../kernels/aie2p/matvec_288x288x1/build/insts.bin");
+
+pub const MATVEC_288X288_KERNEL_ID: u32 = 0x901;
+pub const MATVEC_288X288_OPS_PER_CYCLE: u32 = 2048;
+pub const MATVEC_288X288_COLUMNS: u32 = 8;
+pub const MATVEC_288X288_M: usize = 288;
+pub const MATVEC_288X288_K: usize = 288;
+
+pub mod matvec_288x288_args {
+    pub use super::passthrough_4k_args::*;
+    pub const A: usize = BO0;       // 165 888 B  (M*K*i16)
+    pub const B: usize = BO1;       //     576 B  (K*i16)
+    pub const C: usize = BO2;       //   1 152 B  (M*i32)
+}

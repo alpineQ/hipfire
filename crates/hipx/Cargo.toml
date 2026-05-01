@@ -35,3 +35,7 @@ path = "src/bin/vec_scalar_mul.rs"
 [[bin]]
 name = "hipx-passthrough-dmas"
 path = "src/bin/passthrough_dmas.rs"
+
+[[bin]]
+name = "hipx-matvec"
+path = "src/bin/matvec.rs"

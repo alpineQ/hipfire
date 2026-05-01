@@ -16,7 +16,7 @@ PDI exists for that op class.
 |---------------------|-----------|----------------------------|--------|
 | `passthrough_4k`    | 8 cols    | objectfifo direct          | ✅ PASS |
 | `passthrough_dmas`  | 1 col     | MemTile-routed DMA         | ✅ PASS |
-| `vec_scalar_mul`    | 8 cols    | Worker + core int compute  | ✅ PASS (flaky, fix pending) |
+| `vec_scalar_mul`    | 8 cols    | Worker + core int compute  | ✅ PASS (50/50 multi-iter) |
 
 Engine-side smoke test:
 
@@ -79,25 +79,34 @@ Optional (for compiling new kernels):
 - MLIR-AIE / Peano toolchain — bootstrapped via uv-managed Python
   3.12 in `~/mlir-aie/ironenv` (Ubuntu 26.04 ships only 3.14).
 
-## Worker-class status: works (flaky)
+## Worker-class status: deterministic
 
-`vec_scalar_mul` (Worker + ObjectFifo + core int multiply) now
-dispatches end-to-end and produces correct output (`output[i] =
-input[i] * 7 (i16)` for 4096 elements). The decisive find: a kernel
-printk patch we'd added during diagnostics was calling
-`amdxdna_gem_vmap()` on the cmd BO, which created a kernel-space
-mapping that interfered with the firmware's IOMMU mapping for
-Worker-class kernels. Reverting the patch unblocked the dispatch.
+`vec_scalar_mul` (Worker + ObjectFifo + core int multiply) dispatches
+end-to-end and produces correct output (`output[i] = input[i] * 7 (i16)`
+for 4096 elements) across 50/50 in-process iterations.
 
-The dispatch is currently flaky — first run after a fresh module
-load reliably PASSes; multi-iteration in-process tests show some
-iterations PASS and some partial-fail (e.g. 480/4096 mismatches —
-88% correct, suggesting writes start but don't complete). The
-remaining work is sync semantics — proper `SYNCOBJ_TIMELINE_WAIT`
-usage (currently we always EINVAL and fall through to a 100ms sleep)
-or a state reset between submissions.
+Three bugs combined to make Worker-class kernels look "flaky" during
+bring-up:
 
-The flakiness gates the press-coverage perf number but not the
-architectural moat — KV-codec / INT8 GEMM kernels can be authored
-and dispatched today; they'll just need the sync fix to ship as
-production-quality offload.
+1. **Wrong DRM ioctl numbers**: `SYNCOBJ_WAIT_NR` was 0xCA (should be
+   0xC3); `TIMELINE_WAIT_NR` was 0xCF (should be 0xCA). Per `<drm/drm.h>`
+   uapi. SYNCOBJ_WAIT was hitting TIMELINE_WAIT (extra `points` field
+   zero-padded looked "signaled at point 0"); TIMELINE_WAIT was hitting
+   SYNCOBJ_EVENTFD which EINVAL'd, leaving the binaries to fall through
+   to a 100 ms safety sleep. The "first run PASS, later runs FAIL"
+   pattern was firmware completing in <100 ms cold and missing on the
+   warmer iterations.
+2. **Cmd-packet state field**: stays at COMPLETED after each submit;
+   firmware skips re-execution of a still-COMPLETED packet. Added
+   `ert::reset_state(&mut buf[..4])` to patch the state nibble back to
+   NEW between submissions. XRT does this implicitly when it rebuilds
+   the cmd packet each time; we re-use the BO for perf.
+3. **SYNC_BO required for SHMEM-backed BOs**: the prior code had a
+   comment claiming "PASID + cache-coherent x86" obviated `SYNC_BO`
+   calls — wrong. AMD's working test does them, `passthrough_dmas`
+   (which works) does them; only `vec_scalar_mul` had skipped them.
+   The worker tile's writes don't propagate to the host CPU view
+   without `DRM_IOCTL_AMDXDNA_SYNC_BO {SYNC_FROM_DEVICE}`.
+
+With those three fixed, Worker-class is production-quality. KV-codec /
+INT8 GEMM kernels can be authored against this surface today.
