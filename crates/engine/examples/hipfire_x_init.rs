@@ -352,6 +352,49 @@ fn run() {
             }
             Err(e) => println!("  FAIL: {e}"),
         }
+
+        // 1024^3 INT8 — the press-headline shape (4.5 TOp/s standalone).
+        println!("\n[hipfire-x] engine-API NPU dispatch (matmul_i8_1024_4c):");
+        let m1k = 1024usize;
+        let mut a1k = vec![0i8; m1k * m1k];
+        let mut b1k = vec![0i8; m1k * m1k];
+        for r in 0..m1k {
+            for k in 0..m1k {
+                a1k[r * m1k + k] = ((r + k) as i8) & 0x3;
+                b1k[r * m1k + k] = ((r + k) as i8) & 0x3;
+            }
+        }
+        let mut c1k = vec![0i32; m1k * m1k];
+        let t0 = std::time::Instant::now();
+        match rt.matmul_i8_1024_4c(&a1k, &b1k, &mut c1k) {
+            Ok(()) => {
+                let warm_us = t0.elapsed().as_micros();
+                let mut errs = 0;
+                for c in 0..8 {
+                    let mut want: i32 = 0;
+                    for k in 0..m1k {
+                        want += a1k[k] as i32 * b1k[k * m1k + c] as i32;
+                    }
+                    if c1k[c] != want { errs += 1; }
+                }
+                if errs == 0 {
+                    let n = 20u32;
+                    let t = std::time::Instant::now();
+                    for _ in 0..n {
+                        rt.matmul_i8_1024_4c(&a1k, &b1k, &mut c1k).expect("mm1k");
+                    }
+                    let mean_us = t.elapsed().as_micros() / n as u128;
+                    let macs = 2.0 * m1k as f64 * m1k as f64 * m1k as f64;
+                    let tops = macs / (mean_us as f64 / 1e6) / 1e12;
+                    println!(
+                        "  PASS — first {warm_us} us; warm mean {mean_us} us → {tops:.2} TOp/s INT8 ({n} iters, 1024^3)"
+                    );
+                } else {
+                    println!("  FAIL — {errs}/8 first-row mismatches");
+                }
+            }
+            Err(e) => println!("  FAIL: {e}"),
+        }
             }
             Err(e) => println!("  FAIL: {e}"),
         }
