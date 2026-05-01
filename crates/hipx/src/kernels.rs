@@ -214,3 +214,27 @@ pub mod matmul_i8_2048_4c_args {
     pub const B: usize = BO1;     // 4 194 304 B   (K*N*i8)
     pub const C: usize = BO2;     // 16 777 216 B  (M*N*i32 = 16 MiB)
 }
+
+/// 4-core whole-array bf16×bf16→f32 matmul, M=K=N=512, tile 32×32×32.
+/// The natural-precision shape for LLM workloads — FP16 hidden states
+/// and FP16 weights map directly into bf16 (lossy but production-typical
+/// after rounding). A and B are bf16 (2 bytes each), C is f32.
+pub const MATMUL_BF16_512_4C_PDI: &[u8] =
+    include_bytes!("../../../kernels/aie2p/matmul_bf16_512_4c/build/main.pdi");
+
+pub const MATMUL_BF16_512_4C_INSTS: &[u8] =
+    include_bytes!("../../../kernels/aie2p/matmul_bf16_512_4c/build/insts.bin");
+
+pub const MATMUL_BF16_512_4C_KERNEL_ID: u32 = 0x901;
+pub const MATMUL_BF16_512_4C_OPS_PER_CYCLE: u32 = 2048;
+pub const MATMUL_BF16_512_4C_COLUMNS: u32 = 8;
+pub const MATMUL_BF16_512_4C_M: usize = 512;
+pub const MATMUL_BF16_512_4C_K: usize = 512;
+pub const MATMUL_BF16_512_4C_N: usize = 512;
+
+pub mod matmul_bf16_512_4c_args {
+    pub use super::passthrough_4k_args::*;
+    pub const A: usize = BO0;     // 524 288 B   (M*K*bf16)
+    pub const B: usize = BO1;     // 524 288 B   (K*N*bf16)
+    pub const C: usize = BO2;     // 1 048 576 B (M*N*f32)
+}
