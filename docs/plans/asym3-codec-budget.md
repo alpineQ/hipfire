@@ -138,6 +138,35 @@ authoring.
 | kv_fold_asym3                | per eviction       | ❌ no    | 2 µs compute, ~40× overhead          |
 | **K-prefetch pipeline**      | layer N+1 hidden   | ✅ yes   | overhead hides behind iGPU layer N   |
 
+## Design refinement (2026-05-02)
+
+After surveying the engine call sites: a standalone `dequant_asym3
+→ bf16` kernel on NPU has **no current downstream consumer**.
+
+- `gpu.triattn_score_asym3` does fused dequant+score inline; it
+  takes asym3 K directly and would need a parallel `_bf16` variant
+  (and the matching iGPU kernel doesn't exist).
+- `gpu.kv_fold_asym3` operates in asym3-space (Givens orthogonality
+  exploit) — does not need bf16 K either.
+- Per-token decode `gpu.attention_asym3_kv` likewise fuses dequant.
+
+So the offload target is not `dequant_asym3` standalone — it's a
+**full asym3 score kernel** on NPU that subsumes both dequant and
+the score reduction. This re-shapes the spec:
+
+- Kernel: `asym3_score_all_layers` — input is the fa_layer_ids set
+  of K caches + a pre-rotated centers matrix; output is `[n_layers
+  × budget × n_kv_heads × head_dim]` scores in bf16.
+- Compute per call (27B Gemma, 4K context, 46 fa-layers):
+  46 × (4096 × 8 × 256) = 386M MACs → 375 µs at 1.03 TOp/s bf16.
+- Dispatch overhead: 80 µs no-copy (one call covers all 46 layers).
+- Engine call site: `crates/engine/src/cask.rs::eviction_step`
+  line 134 (`for (fa_i, &layer_idx) in self.fa_layer_ids…`).
+  Hook converts the per-layer loop into a single batched NPU
+  submit + per-layer iGPU continuation.
+- Replaces / shadows: `gpu.triattn_score_asym3` per-layer call
+  (line 146 in cask.rs); the NPU runs ahead of the iGPU.
+
 ## Recommended kernel to author
 
 **`asym3_dequant_layer_to_bf16`** — operates on a single layer's
