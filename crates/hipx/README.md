@@ -44,18 +44,28 @@ bf16). They're the natural offload target for FP16 hot-path tensors
 (attention scoring, hidden-state projection); INT8 stays the speed
 champion for quantized-weight workloads.
 
-**Concurrent dispatch demo** (`hipfire_x_concurrent` example):
+**Concurrent dispatch — rigorous bench** (`hipfire_x_overlap_rigor`,
+3 trials × 1000 iters, iGPU proxy is real rocBLAS fp16 GEMM 2048^3
+≈ 17 GFLOPs of read+compute work, not a memset):
 
 ```
-NPU 1024^3 i8 alone:                    1015 µs/op  (2.13 TOp/s)
-iGPU 32 MiB memset alone:                 51 µs/op
-NPU + 32 MiB iGPU concurrent:            985 µs/op  ← negative cost
+                              median   p95    p99    inter-trial CV
+NPU 1024^3 i8 alone           496 µs   504    548    0.000 %
+iGPU rocBLAS fp16 2048^3      559 µs   631    657    0.368 %
+NPU + iGPU concurrent         601 µs   675    716    0.282 %
+
+→ saved by overlap: 448–457 µs across 3 trials = 42.6 – 43.2 %
+  wall-clock (≈ 91 % of the theoretical max overlap of
+  min(NPU,iGPU)=496 µs).
 ```
 
-Adding a 32 MiB iGPU memset to the NPU matmul makes the wall-clock
-*shorter* than NPU alone — the iGPU dispatch fits entirely inside
-the NPU compute window. This is what "free overlap" means in the
-size-matched regime that real LLM workloads operate in.
+Read: against a real iGPU GEMM workload the overlap saves
+**~43 % of serial wall-clock**, with inter-trial CV under 0.4 % —
+the saving is real, not noise. The earlier `hipfire_x_concurrent`
+example used a 256 MiB memset which is bandwidth-degenerate (pure
+write BW, no compute) and produced a misleading "negative cost"
+artifact; that bench is kept for the toy/end-to-end smoke check
+but is no longer the headline number.
 
 **Multi-layer pipeline demo** (`hipfire_x_pipeline` example, 28
 layers ≈ 27B Gemma depth, per-layer iGPU work matched to NPU
