@@ -41,6 +41,7 @@ pub mod kernels;
 pub mod cmd;
 pub mod fence;
 pub mod prime;
+pub mod ert;
 
 #[derive(Debug)]
 pub struct XdnaError {
