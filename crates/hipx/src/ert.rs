@@ -79,6 +79,30 @@ pub struct ErtBuilder<'b> {
     cu_mask_set: bool,
     npu_data_set: bool,
     arg_offset: usize, // byte offset where kernel args start
+    opcode: u32,
+}
+
+impl<'b> ErtBuilder<'b> {
+    /// ERT_START_CU layout: header + cu_mask + register-map. No
+    /// npu_data prefix. Verified against AMD's working passthrough
+    /// test via in-kernel cmd-bo printk.
+    ///
+    /// Header is patched in `finalize()`.
+    pub fn new_start_cu(buf: &'b mut [u8]) -> Self {
+        for b in buf.iter_mut() {
+            *b = 0;
+        }
+        let placeholder = build_header(ERT_START_CU, ERT_CU_TYPE, 0);
+        buf[0..4].copy_from_slice(&placeholder.to_le_bytes());
+        Self {
+            buf,
+            cursor: 1,
+            cu_mask_set: false,
+            npu_data_set: true, // no npu_data for ERT_START_CU
+            arg_offset: 0,
+            opcode: ERT_START_CU,
+        }
+    }
 }
 
 impl<'b> ErtBuilder<'b> {
@@ -101,6 +125,7 @@ impl<'b> ErtBuilder<'b> {
             cu_mask_set: false,
             npu_data_set: false,
             arg_offset: 0,
+            opcode: ERT_START_NPU,
         }
     }
 
@@ -113,6 +138,10 @@ impl<'b> ErtBuilder<'b> {
             self.cursor += 1;
         }
         self.cu_mask_set = true;
+        // For ERT_START_CU, args start immediately after cu_mask.
+        if self.opcode == ERT_START_CU {
+            self.arg_offset = self.cursor * 4;
+        }
         self
     }
 
@@ -152,19 +181,17 @@ impl<'b> ErtBuilder<'b> {
     }
 
     /// Finalize the packet: patch the `count` field of the header
-    /// based on `arg_space_bytes`. `count` = total payload dwords
-    /// after header - 1, per ert.h convention.
+    /// based on `arg_space_bytes`. `count` is the dword count AFTER
+    /// the header dword (so it covers cu_mask + optional npu_data +
+    /// the register-map). Verified against AMD's working passthrough
+    /// test: count=16 for ERT_START_CU with 5 BO args + opcode/instr/ninstr.
     pub fn finalize(&mut self, arg_space_bytes: usize) -> usize {
-        let total_payload_dwords =
-            (self.arg_offset + arg_space_bytes) / 4 - 1; // minus the header dword itself? no — the dwords AFTER header
-        // count is "(total dwords) - 1" i.e. arg + npu_data + cu_mask
-        let total_dwords_after_header = (self.arg_offset + arg_space_bytes) / 4 - 1;
-        // ^ above the header is at dword 0. After-header runs from
-        //   dword 1 to (arg_offset + args)/4 - 1 inclusive. That count.
-        let count = total_dwords_after_header as u32;
-        let header = build_header(ERT_START_NPU, ERT_CU_TYPE, count);
+        let total_bytes = self.arg_offset + arg_space_bytes;
+        // Header is at dword 0; payload runs dwords 1..total_dwords-1.
+        // count = (total_dwords - 1) — i.e. payload dwords after header.
+        let count = ((total_bytes / 4) as u32).saturating_sub(1);
+        let header = build_header(self.opcode, ERT_CU_TYPE, count);
         self.buf[0..4].copy_from_slice(&header.to_le_bytes());
-        let _ = total_payload_dwords;
-        (self.arg_offset + arg_space_bytes) // total bytes written
+        total_bytes
     }
 }

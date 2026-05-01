@@ -167,8 +167,9 @@ fn main() -> ExitCode {
     };
     {
         let buf = output_bo.map().expect("map(output)");
+        // Sentinel to detect "NPU wrote nothing" vs "NPU wrote zeros"
         for b in buf[..SIZE].iter_mut() {
-            *b = 0;
+            *b = 0xAB;
         }
     }
     let _ = output_bo.sync(SYNC_TO_DEVICE);
@@ -194,9 +195,11 @@ fn main() -> ExitCode {
     };
     let cmd_size = {
         let cbuf = cmd_bo.map().expect("map(cmd)");
-        let mut eb = ErtBuilder::new_start_npu(&mut cbuf[..256]);
+        // AMD test (verified via in-kernel printk of cmd_bo) uses
+        // ERT_START_CU, NOT ERT_START_NPU — no npu_data prefix; args
+        // begin immediately after cu_mask.
+        let mut eb = ErtBuilder::new_start_cu(&mut cbuf[..256]);
         eb.set_cu_mask(0x1);
-        eb.set_npu_data(instr_bo.xdna_addr, PASSTHROUGH_4K_INSTS.len() as u32);
         eb.set_arg_u64(args::OPCODE, 3);
         eb.set_arg_u64(args::INSTR_PTR, instr_bo.xdna_addr);
         eb.set_arg_u32(args::NINSTR, ninstr_dwords);
@@ -238,16 +241,26 @@ fn main() -> ExitCode {
     };
     println!("[passthrough] EXEC_CMD seq={seq}");
 
-    // (10) Timeline wait at the returned sequence. dmesg confirms the
-    // job actually completes ("total completed jobs 1"), so the wait
-    // failing with EINVAL is an args issue, not a real timeout.
-    if let Err(e) = timeline_wait(
-        hipx.device.fd,
-        ctx.syncobj_handle,
-        seq,
-        Duration::from_secs(5),
-    ) {
-        eprintln!("timeline_wait(point={seq}): {e} — but ctx may have completed; trying without wait");
+    // (10) Timeline wait at the returned sequence. Try point=seq+1
+    // (1-indexed) which is the AMD/XRT convention.
+    let mut waited = false;
+    for point in [seq, seq + 1, seq.saturating_add(2)] {
+        if timeline_wait(
+            hipx.device.fd,
+            ctx.syncobj_handle,
+            point,
+            Duration::from_secs(5),
+        )
+        .is_ok()
+        {
+            println!("[passthrough] timeline_wait point={point} returned");
+            waited = true;
+            break;
+        }
+    }
+    if !waited {
+        eprintln!("[passthrough] all timeline_wait points failed; sleeping 100ms");
+        std::thread::sleep(Duration::from_millis(100));
     }
     println!("[passthrough] syncobj signaled");
 
@@ -255,6 +268,26 @@ fn main() -> ExitCode {
     let _ = output_bo.sync(hipx::ioctl::SYNC_FROM_DEVICE);
     let inp = input_bo.map().expect("re-map(input)").to_vec();
     let outp = output_bo.map().expect("re-map(output)");
+
+    let mut hist = [0u32; 256];
+    for &b in &outp[..SIZE] {
+        hist[b as usize] += 1;
+    }
+    let mut top: Vec<(u8, u32)> = (0u8..=255u8)
+        .map(|v| (v, hist[v as usize]))
+        .filter(|(_, c)| *c > 0)
+        .collect();
+    top.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+    eprint!("[passthrough] output histogram (top 5): ");
+    for (v, c) in top.iter().take(5) {
+        eprint!("{v:#04x}={c} ");
+    }
+    eprintln!();
+    eprintln!(
+        "[passthrough] output first 16 bytes: {:02x?}",
+        &outp[..16]
+    );
+
     let mut errors = 0;
     let mut first_bad = None;
     for i in 0..SIZE {
