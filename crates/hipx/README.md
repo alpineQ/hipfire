@@ -57,6 +57,24 @@ Adding a 32 MiB iGPU memset to the NPU matmul makes the wall-clock
 the NPU compute window. This is what "free overlap" means in the
 size-matched regime that real LLM workloads operate in.
 
+**Multi-layer pipeline demo** (`hipfire_x_pipeline` example, 28
+layers ≈ 27B Gemma depth, per-layer iGPU work matched to NPU
+dispatch time):
+
+```
+A. iGPU-only forward:           33523 us total (1197 us/layer baseline)
+B. iGPU + NPU serial:           68956 us total (2462 us/layer)
+C. iGPU + NPU pipelined:        49171 us total (1756 us/layer)
+saved by pipelining:            19785 us (28% wall-clock vs serial)
+NPU added cost vs baseline:       559 us/layer (vs 1265 us if serial)
+NPU effective throughput:        1.22 TOp/s INT8 sustained
+```
+
+Read: adding 1.22 TOp/s of NPU compute to a realistic per-layer
+LLM workflow costs only 559 µs per layer of additional wall-clock
+— 44% of what serial dispatch would cost. The other 56% is hidden
+behind iGPU work via the previous-wait/current-iGPU overlap pattern.
+
 Engine-side smoke test:
 
 ```
