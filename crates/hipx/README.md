@@ -12,11 +12,28 @@ PDI exists for that op class.
 
 ## What works (verified on hipx — Ryzen AI MAX+ 395 / NPU5)
 
+Bring-up tier:
+
 | Kernel              | Partition | Dataflow                   | Status |
 |---------------------|-----------|----------------------------|--------|
 | `passthrough_4k`    | 8 cols    | objectfifo direct          | ✅ PASS |
 | `passthrough_dmas`  | 1 col     | MemTile-routed DMA         | ✅ PASS |
 | `vec_scalar_mul`    | 8 cols    | Worker + core int compute  | ✅ PASS (50/50 multi-iter) |
+
+Performance tier:
+
+| Kernel              | Shape          | Standalone        | Engine API       |
+|---------------------|----------------|-------------------|------------------|
+| `matvec`            | 288×288 i16    | 0.31 GOp/s         | 0.30 GOp/s zero-copy |
+| `matmul-512`        | 512^3 i16      | **1.04 TOp/s**     | 0.43 TOp/s        |
+| `matmul-i8`         | 512^3 i8       | **1.97 TOp/s**     | 1.04 TOp/s zero-copy |
+| `matmul-i8-1024`    | 1024^3 i8      | **4.46 TOp/s**     | 1.79 TOp/s        |
+
+The 4.46 TOp/s INT8 figure is sustained — 50 iterations, 482 µs mean
+dispatch, 2.1 GMACs per call. Strix Halo NPU peak is ~50 TOPS INT8,
+so we sit at ~9% peak on a generic non-tuned MLIR-AIE kernel. The
+remaining 91% is hand-tuned MAC inner loops + larger tile sizes —
+follow-up work, not bring-up.
 
 Engine-side smoke test:
 
