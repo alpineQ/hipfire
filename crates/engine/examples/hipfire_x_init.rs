@@ -117,6 +117,46 @@ fn run() {
                     println!(
                         "  PASS — first {warm_us} us; warm mean {mean_us} us → {gops:.2} GOp/s ({n} iters, M=K={m})"
                     );
+
+                    // Split-dispatch: shows that submit returns fast so
+                    // the engine can do iGPU work in parallel. Times
+                    //   submit
+                    //   <host work simulating iGPU dispatch overlap>
+                    //   wait
+                    // and reports the submit-to-wait gap explicitly.
+                    let n_split = 20u32;
+                    let mut total_submit_us: u128 = 0;
+                    let mut total_overlap_us: u128 = 0;
+                    let mut total_wait_us: u128 = 0;
+                    for _ in 0..n_split {
+                        let t0 = std::time::Instant::now();
+                        let seq = rt
+                            .matvec_i16_288x288_submit(&a, &b)
+                            .expect("submit");
+                        let t1 = std::time::Instant::now();
+                        // simulated concurrent host/iGPU work — a memcpy
+                        // of the same volume the iGPU would touch on a
+                        // partial decode (1 MiB). Real engine integration
+                        // would call into rdna-compute here.
+                        let mut sink = vec![0u8; 1 << 20];
+                        for byte in sink.iter_mut() {
+                            *byte = 0xAB;
+                        }
+                        std::hint::black_box(&sink[0]);
+                        let t2 = std::time::Instant::now();
+                        rt.matvec_i16_288x288_wait(seq, &mut c).expect("wait");
+                        let t3 = std::time::Instant::now();
+                        total_submit_us += t1.duration_since(t0).as_micros();
+                        total_overlap_us += t2.duration_since(t1).as_micros();
+                        total_wait_us += t3.duration_since(t2).as_micros();
+                    }
+                    println!(
+                        "  split-dispatch ({n_split} iters): submit~{} us, overlap~{} us, wait~{} us, total~{} us",
+                        total_submit_us / n_split as u128,
+                        total_overlap_us / n_split as u128,
+                        total_wait_us / n_split as u128,
+                        (total_submit_us + total_overlap_us + total_wait_us) / n_split as u128
+                    );
                 } else {
                     println!("  FAIL — {errors}/{m} matvec mismatches");
                 }
