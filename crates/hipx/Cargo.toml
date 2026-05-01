@@ -1,0 +1,25 @@
+[package]
+name = "hipx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust-native AMD XDNA / AIE-2P NPU compute — direct ioctl bypass of XRT and AMD Ryzen AI runtime, sister to redline"
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "hipx-probe"
+path = "src/bin/probe.rs"
+
+[[bin]]
+name = "hipx-bo-roundtrip"
+path = "src/bin/bo_roundtrip.rs"
+
+[[bin]]
+name = "hipx-hwctx-roundtrip"
+path = "src/bin/hwctx_roundtrip.rs"
+
+[[bin]]
+name = "hipx-overview"
+path = "src/bin/overview.rs"

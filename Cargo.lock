@@ -138,6 +138,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipx"
+version = "0.1.8-alpha.2"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "hsa-bridge"
 version = "0.1.9-alpha.1"
 dependencies = [
@@ -390,13 +397,6 @@ name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
-
-[[package]]
-name = "xdna-compute"
-version = "0.1.8-alpha.2"
-dependencies = [
- "libc",
-]
 
 [[package]]
 name = "zmij"

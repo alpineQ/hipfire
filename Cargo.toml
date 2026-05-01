@@ -7,7 +7,7 @@ members = [
     "crates/engine",
     "crates/hipfire-quantize",
     "crates/redline",
-    "crates/xdna-compute",
+    "crates/hipx",
 ]
 
 [workspace.package]
