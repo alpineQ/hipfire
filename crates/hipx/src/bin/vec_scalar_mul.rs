@@ -140,48 +140,46 @@ fn main() -> ExitCode {
         let _ = eb.finalize(0x3C);
     }
 
-    let seq = match submit_exec_cmd(
-        hipx.device.fd, &ctx, &[&cmd_bo],
-        &[&instr_bo, &input_bo, &scale_bo, &output_bo, &bo3_bo, &bo4_bo],
-    ) {
-        Ok(s) => s, Err(e) => { eprintln!("submit: {e}"); return ExitCode::FAILURE; }
-    };
-    println!("[vsm] submitted seq={seq}");
-
-    // Wait + 100ms safety
-    for point in [seq, seq + 1, seq.saturating_add(2)] {
-        if timeline_wait(hipx.device.fd, ctx.syncobj_handle, point,
-                         Duration::from_secs(5)).is_ok() {
-            break;
+    // Run 5 iterations IN-PROCESS to test stability — engine integration
+    // creates ONE NpuRuntime per process and reuses it across many ops.
+    let mut total_pass = 0;
+    let mut total_fail = 0;
+    for iter in 0..5 {
+        // Reset output to sentinel
+        {
+            let buf = output_bo.map().expect("output reset");
+            for b in buf[..OUTPUT_BYTES].iter_mut() { *b = 0xCC; }
         }
-    }
-    std::thread::sleep(Duration::from_millis(100));
-
-    let outp = output_bo.map().expect("re-map output");
-
-    let mut errors = 0;
-    let mut first_bad = None;
-    for i in 0..N_ELEMS {
-        let want = ((i & 0xFF) as i16).wrapping_mul(SCALE as i16);
-        let got_bytes: [u8; 2] = outp[i * 2..i * 2 + 2].try_into().unwrap();
-        let got = i16::from_le_bytes(got_bytes);
-        if got != want {
-            if first_bad.is_none() {
-                first_bad = Some((i, want, got));
+        let seq = match submit_exec_cmd(
+            hipx.device.fd, &ctx, &[&cmd_bo],
+            &[&instr_bo, &input_bo, &scale_bo, &output_bo, &bo3_bo, &bo4_bo],
+        ) {
+            Ok(s) => s, Err(e) => { eprintln!("submit iter {iter}: {e}"); return ExitCode::FAILURE; }
+        };
+        for point in [seq, seq + 1, seq.saturating_add(2)] {
+            if timeline_wait(hipx.device.fd, ctx.syncobj_handle, point,
+                             Duration::from_secs(5)).is_ok() {
+                break;
             }
-            errors += 1;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+
+        let outp = output_bo.map().expect("re-map output");
+        let mut errors = 0;
+        for i in 0..N_ELEMS {
+            let want = ((i & 0xFF) as i16).wrapping_mul(SCALE as i16);
+            let got_bytes: [u8; 2] = outp[i * 2..i * 2 + 2].try_into().unwrap();
+            let got = i16::from_le_bytes(got_bytes);
+            if got != want { errors += 1; }
+        }
+        if errors == 0 {
+            println!("[vsm] iter {iter} seq={seq} PASS");
+            total_pass += 1;
+        } else {
+            println!("[vsm] iter {iter} seq={seq} FAIL ({errors}/{N_ELEMS} mismatches)");
+            total_fail += 1;
         }
     }
-    if errors == 0 {
-        println!("[vsm] PASS — {N_ELEMS} elements: output[i] = input[i] * {SCALE} (i16)");
-        ExitCode::SUCCESS
-    } else {
-        println!("[vsm] FAIL: {errors}/{N_ELEMS} mismatches; first {first_bad:?}");
-        eprintln!("[vsm] first 16 output i16: {:?}",
-                  (0..16).map(|i| {
-                      let b: [u8;2] = outp[i*2..i*2+2].try_into().unwrap();
-                      i16::from_le_bytes(b)
-                  }).collect::<Vec<_>>());
-        ExitCode::FAILURE
-    }
+    println!("[vsm] in-process: {total_pass} PASS / {total_fail} FAIL");
+    if total_fail == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
