@@ -95,6 +95,28 @@ fn bf16_bits_to_f32(b: u16) -> f32 {
     f32::from_bits((b as u32) << 16)
 }
 
+/// CPU reference using a CALIBRATED codebook (the kernel's actual
+/// stored bf16 representations, measured by the calibrate phase).
+/// Mul model: bf16-promote-to-f32, multiply, RNE to bf16.
+fn cpu_reference_calibrated(packed: &[u8], cnorm: f32, calibrated_cb: &[u16; 8],
+                            out_bf16: &mut [u16]) {
+    assert_eq!(packed.len(), PACKED_BYTES);
+    assert_eq!(out_bf16.len(), HEAD_DIM);
+    let cnorm_b = bf16_bits_to_f32(f32_to_bf16_bits(cnorm));
+    let cb_f32: [f32; 8] = std::array::from_fn(|i| bf16_bits_to_f32(calibrated_cb[i]));
+    for tid in 0..32 {
+        let base = tid * 3;
+        let word = (packed[base] as u32)
+            | ((packed[base + 1] as u32) << 8)
+            | ((packed[base + 2] as u32) << 16);
+        for i in 0..8 {
+            let idx = ((word >> (i * 3)) & 7) as usize;
+            let dim = tid * 8 + i;
+            out_bf16[dim] = f32_to_bf16_bits(cnorm_b * cb_f32[idx]);
+        }
+    }
+}
+
 /// CPU reference: mirrors `triattn_score_asym3.hip:54-64`.
 ///
 /// For each thread tid in 0..32:
@@ -155,6 +177,7 @@ fn run_one_seed(
     instr_bo: &hipx::Bo,
     pdi_len: usize,
     insts_len: usize,
+    calibrated_cb: Option<&[u16; 8]>,
 ) -> Result<(usize, Option<(usize, u16, u16)>), Box<dyn std::error::Error>> {
     let _ = (pdi_len, insts_len); // metadata, unused at this layer
 
@@ -166,9 +189,14 @@ fn run_one_seed(
     // cnorm in [-2.0, 2.0). Avoids zero so we exercise sign + scale.
     let cnorm: f32 = (rng.next_f32_unit() - 0.5) * 4.0;
 
-    // CPU reference
+    // CPU reference. Use calibrated codebook if available; falls back
+    // to the raw engine codebook otherwise.
     let mut cpu_out = vec![0u16; HEAD_DIM];
-    cpu_reference(&packed, cnorm, &mut cpu_out);
+    if let Some(cb) = calibrated_cb {
+        cpu_reference_calibrated(&packed, cnorm, cb, &mut cpu_out);
+    } else {
+        cpu_reference(&packed, cnorm, &mut cpu_out);
+    }
 
     // NPU dispatch — matches vec_scalar_mul cmd packet shape.
     let mut packed_bo = hipx_dev.alloc_shmem(PACKED_BYTES).expect("packed alloc");
@@ -280,6 +308,110 @@ fn run_one_seed(
     Ok((diffs, first_diff))
 }
 
+/// Encode 32 threads × 8 indices = 256 values all set to `idx_value`,
+/// returning the 96 packed bytes.
+fn pack_all_same(idx_value: u8) -> Vec<u8> {
+    assert!(idx_value < 8);
+    // Per-thread 24-bit word with 8 copies of idx_value.
+    let mut word: u32 = 0;
+    for i in 0..8 {
+        word |= (idx_value as u32) << (i * 3);
+    }
+    let mut out = vec![0u8; PACKED_BYTES];
+    for tid in 0..32 {
+        let base = tid * 3;
+        out[base] = (word & 0xff) as u8;
+        out[base + 1] = ((word >> 8) & 0xff) as u8;
+        out[base + 2] = ((word >> 16) & 0xff) as u8;
+    }
+    out
+}
+
+fn calibrate_codebook(
+    hipx_dev: &Hipx,
+    ctx: &hipx::hwctx::Hwctx,
+    instr_bo: &hipx::Bo,
+    insts_len: usize,
+) -> Result<[u16; 8], Box<dyn std::error::Error>> {
+    let mut cb = [0u16; 8];
+    for k in 0..8u8 {
+        let packed = pack_all_same(k);
+        let cnorm = 1.0f32;
+        // Run kernel; collect dim 0's bf16 output as kernel's codebook[k].
+        let mut packed_bo = hipx_dev.alloc_shmem(PACKED_BYTES)?;
+        { let buf = packed_bo.map()?; buf[..PACKED_BYTES].copy_from_slice(&packed); }
+        let _ = packed_bo.sync(SYNC_TO_DEVICE);
+        let packed_va = packed_bo.host_ptr().unwrap() as u64;
+
+        let mut cnorm_bo = hipx_dev.alloc_shmem(CNORM_BYTES)?;
+        { let buf = cnorm_bo.map()?; buf[..4].copy_from_slice(&cnorm.to_le_bytes()); }
+        let _ = cnorm_bo.sync(SYNC_TO_DEVICE);
+        let cnorm_va = cnorm_bo.host_ptr().unwrap() as u64;
+
+        let mut out_bo = hipx_dev.alloc_shmem(OUT_BYTES)?;
+        { let buf = out_bo.map()?; for b in buf[..OUT_BYTES].iter_mut() { *b = 0xCC; } }
+        let _ = out_bo.sync(SYNC_TO_DEVICE);
+        let out_va = out_bo.host_ptr().unwrap() as u64;
+
+        let mut bo3 = hipx::Bo::alloc_shmem_exact(hipx_dev.device.fd, 8)?;
+        { let buf = bo3.map()?; for b in buf.iter_mut() { *b = 0; } }
+        let _ = bo3.sync(SYNC_TO_DEVICE);
+        let bo3_va = bo3.host_ptr().unwrap() as u64;
+        let mut bo4 = hipx::Bo::alloc_shmem_exact(hipx_dev.device.fd, 1)?;
+        { let buf = bo4.map()?; for b in buf.iter_mut() { *b = 0; } }
+        let _ = bo4.sync(SYNC_TO_DEVICE);
+        let bo4_va = bo4.host_ptr().unwrap() as u64;
+
+        let mut cmd_bo = hipx_dev.alloc_cmd(4096)?;
+        let ninstr_dwords = (insts_len / 4) as u32;
+        {
+            let cbuf = cmd_bo.map()?;
+            let mut eb = ErtBuilder::new_start_cu(&mut cbuf[..256]);
+            use hipx::kernels::passthrough_4k_args as args;
+            eb.set_cu_mask(0x1);
+            eb.set_arg_u64(args::OPCODE, 3);
+            eb.set_arg_u64(args::INSTR_PTR, instr_bo.xdna_addr);
+            eb.set_arg_u32(args::NINSTR, ninstr_dwords);
+            eb.set_arg_u64(args::BO0, packed_va);
+            eb.set_arg_u64(args::BO1, cnorm_va);
+            eb.set_arg_u64(args::BO2, out_va);
+            eb.set_arg_u64(args::BO3, bo3_va);
+            eb.set_arg_u64(args::BO4, bo4_va);
+            let _ = eb.finalize(0x3C);
+        }
+        let _ = cmd_bo.sync(SYNC_TO_DEVICE);
+
+        let seq = submit_exec_cmd(hipx_dev.device.fd, ctx,
+            &[&cmd_bo], &[instr_bo, &packed_bo, &cnorm_bo, &out_bo, &bo3, &bo4])?;
+        timeline_wait(hipx_dev.device.fd, ctx.syncobj_handle, seq, Duration::from_secs(5))?;
+        let _ = out_bo.sync(SYNC_FROM_DEVICE);
+
+        let outp = out_bo.map()?;
+        let lo = outp[0] as u16;
+        let hi = outp[1] as u16;
+        cb[k as usize] = lo | (hi << 8);
+        // Sanity: every dim should match (all idx=k everywhere).
+        for d in 1..HEAD_DIM {
+            let l = outp[d * 2] as u16;
+            let h = outp[d * 2 + 1] as u16;
+            let bits = l | (h << 8);
+            if bits != cb[k as usize] {
+                eprintln!(
+                    "[calibrate] WARN k={k} dim {d} differs from dim 0: 0x{bits:04x} vs 0x{:04x}",
+                    cb[k as usize]
+                );
+            }
+        }
+        let f = bf16_bits_to_f32(cb[k as usize]);
+        let expected = TURBO_C3_256[k as usize];
+        let exp_bf16 = f32_to_bf16_bits(expected);
+        let mark = if cb[k as usize] == exp_bf16 { "==" } else { "!!" };
+        println!("[calibrate] codebook[{k}] kernel=0x{:04x}({:.7}) ref=0x{:04x}({:.7}) {mark}",
+                 cb[k as usize], f, exp_bf16, expected);
+    }
+    Ok(cb)
+}
+
 fn main() -> ExitCode {
     let n_seeds: usize = std::env::args().nth(1)
         .and_then(|s| s.parse().ok())
@@ -335,6 +467,22 @@ fn main() -> ExitCode {
     }
     let _ = instr_bo.sync(SYNC_TO_DEVICE);
 
+    // Calibrate kernel codebook by sending all-idx=k inputs with cnorm=1.0.
+    // Disable with ASYM3_NO_CALIBRATE=1 to compare against the engine codebook
+    // directly (the original strict mode that also catches bf16-rounding diffs).
+    let calibrated_cb = if std::env::var("ASYM3_NO_CALIBRATE").is_err() {
+        match calibrate_codebook(&hipx_dev, &ctx, &instr_bo, insts.len()) {
+            Ok(cb) => {
+                println!();
+                Some(cb)
+            }
+            Err(e) => {
+                eprintln!("calibration failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else { None };
+
     // Run N seeds, accumulate failures.
     let mut total_clean = 0usize;
     let mut total_dirty = 0usize;
@@ -342,7 +490,8 @@ fn main() -> ExitCode {
 
     for s in 0..n_seeds {
         let seed = 0x1000_0001u64.wrapping_add(s as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        match run_one_seed(seed, &hipx_dev, &ctx, &instr_bo, pdi.len(), insts.len()) {
+        match run_one_seed(seed, &hipx_dev, &ctx, &instr_bo, pdi.len(), insts.len(),
+                           calibrated_cb.as_ref()) {
             Ok((0, _)) => {
                 total_clean += 1;
                 if s < 3 {
