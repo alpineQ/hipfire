@@ -1,5 +1,77 @@
 # Manual Review Queue (npu-roadmap/2026-05-02)
 
+## ESCALATED-6: Prefill viability via 32c i8 GEMM (final, 2026-05-02)
+
+This session pivoted to prefill viability after stage 1.5 closed. The
+hypothesis: NPU 32c i8 GEMM concurrent with iGPU prefill would lift
+end-to-end prefill tok/s by >=1.4x via additive compute on UMA.
+
+Three substantial 32c kernel attempts:
+
+  matmul_i8_512_32c   (commit 249dda1, fixes: 29ae5e6 578ff0a fd3ab2d)
+    M=K=N=512, m=64 k=64 n=32, row-major B
+    Steady throughput: 1.73 TOp/s
+    Bottleneck: dispatch-amortization (~67us floor, 88us compute)
+
+  matmul_i8_1024_32c  (commit 39d3b3c)
+    M=K=N=1024, m=64 k=64 n=32, COL-MAJOR B (b-col-maj=1 dodges DMA
+                                              size limit)
+    Steady throughput: 4.74 TOp/s   (best observed)
+    Bottleneck: NPU2 only uses 4 shim tiles to feed A across 8 cols
+                (n_shim_mem_A = n_aie_rows = 4); per-column A bandwidth
+                is HALF the 4c topology
+
+  matmul_i8_2048_32c  (commit e52f6ec)
+    M=K=N=2048, m=64 k=64 n=32, col-major B
+    Cold throughput: ~3.0 TOp/s   (regression vs 1024^3)
+    Bottleneck: bandwidth saturation worsens at larger working set
+
+Comparison anchors:
+  4c i8 1024^3:    4.55 TOp/s  (single-row 4-core baseline)
+  32c best (1024): 4.74 TOp/s  (only +4% over 4c on same shape)
+  iGPU INT8:       18-20 TOp/s (gfx1151 MMQ at production prefill)
+
+Lift gate analysis (target >= 1.4x):
+  Concurrent split lift = NPU_TOps / iGPU_TOps + 1
+  At best NPU 32c = 4.74 TOp/s: lift = 1.24x   FAIL
+  At hypothetical 6 TOp/s:      lift = 1.31x   FAIL
+  Threshold not reachable at any tested shape.
+
+Root cause (verified, not projected): NPU2 AIE array topology has a
+hard architectural limit on A bandwidth: only 4 shim tiles for 8
+compute columns, half the per-column bandwidth of the 4c topology.
+The 32-core array becomes bandwidth-bound at all tested shapes; adding
+more cores does not yield more throughput. This is a property of the
+NPU2 dataflow design, not a kernel-authoring deficiency.
+
+Levers that could break the wall (all out of session scope):
+  1. Persistent kernel pattern: data stays resident in compute tile
+     L1, only the small "control packet" moves per dispatch.
+     ~40-80h of MLIR authoring work (#48 scoping).
+  2. Different topology that uses A-broadcast across rows differently
+     (e.g. in-place rotation, partial sums across a different
+     dimension). Research-level kernel design.
+  3. Use NPU for a workload with HIGHER compute-to-bandwidth ratio
+     (e.g. fused GEMM + activation + quant in one kernel) that
+     overlaps better with iGPU on UMA.
+
+Decision: prefill viability via concurrent 32c i8 GEMM closes as
+NO-LIFT. Default `HIPFIRE_NPU_DEQUANT` stays 0; no engine integration
+of prefill NPU offload. Tasks #46 (concurrent-split bench) and #48
+(persistent kernel scoping) deferred. Task #47 (Lever 1 command-list
+batching) remains independently viable for any future NPU work but
+no longer has a near-term consumer.
+
+Pointers:
+  bench/prefill-igpu-int8-20260502.txt   (iGPU baseline)
+  findings/prefill-xdna-abi-scan.md       (Lever 1 ABI)
+  findings/prefill-iron-dispatch-analysis.md  (gap to IRON is small)
+  findings/prefill-igpu-int8-baseline.md
+  findings/prefill-32c-bringup-progress.md
+  kernels/aie2p/matmul_i8_{512,1024,2048}_32c/  (kernels stay as
+                                                  reusable infrastructure)
+  crates/hipx/src/bin/matmul_i8_{512,1024,2048}_32c.rs  (benches)
+
 ## ESCALATED-5: Stage 1.5 measured A/B (final, 2026-05-02)
 
 The earlier escalations (ESCALATED-3 + ESCALATED-4) were
