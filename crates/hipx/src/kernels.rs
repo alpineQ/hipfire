@@ -215,6 +215,31 @@ pub mod matmul_i8_2048_4c_args {
     pub const C: usize = BO2;     // 16 777 216 B  (M*N*i32 = 16 MiB)
 }
 
+/// 32-core whole-array i8×i8→i32 matmul, M=K=N=512, tile m=k=n=(64, 64, 32).
+/// 8 cols × 4 rows fan-out (full AIE-2P NPU2 array). MLIR generated via
+/// mlir-aie's whole_array_placed.py once; build path stays Python-free.
+/// Note: M=K=N=1024 hits a DMA descriptor size limit (max 1023 per dim);
+/// larger shapes require K-dim tiling, addressed in subsequent kernels.
+pub const MATMUL_I8_512_32C_PDI: &[u8] =
+    include_bytes!("../../../kernels/aie2p/matmul_i8_512_32c/build/main.pdi");
+
+pub const MATMUL_I8_512_32C_INSTS: &[u8] =
+    include_bytes!("../../../kernels/aie2p/matmul_i8_512_32c/build/insts.bin");
+
+pub const MATMUL_I8_512_32C_KERNEL_ID: u32 = 0x901;
+pub const MATMUL_I8_512_32C_OPS_PER_CYCLE: u32 = 2048;
+pub const MATMUL_I8_512_32C_COLUMNS: u32 = 8;
+pub const MATMUL_I8_512_32C_M: usize = 512;
+pub const MATMUL_I8_512_32C_K: usize = 512;
+pub const MATMUL_I8_512_32C_N: usize = 512;
+
+pub mod matmul_i8_512_32c_args {
+    pub use super::passthrough_4k_args::*;
+    pub const A: usize = BO0;     // 262 144 B (M*K*i8)
+    pub const B: usize = BO1;     // 262 144 B (K*N*i8)
+    pub const C: usize = BO2;     // 1 048 576 B (M*N*i32)
+}
+
 /// 4-core whole-array bf16×bf16→f32 matmul, M=K=N=512, tile 32×32×32.
 /// The natural-precision shape for LLM workloads — FP16 hidden states
 /// and FP16 weights map directly into bf16 (lossy but production-typical
