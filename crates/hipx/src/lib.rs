@@ -43,6 +43,7 @@ pub mod fence;
 pub mod prime;
 pub mod ert;
 pub mod agpu;
+pub mod hsa_dmabuf;
 
 #[derive(Debug)]
 pub struct XdnaError {
