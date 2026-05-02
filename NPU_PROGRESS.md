@@ -7,7 +7,8 @@
 | 1.1 Correctness verifier | DONE (3-gate acceptance, AIE-2P-shape doc'd) | npu-roadmap/2026-05-02 |
 | 1.2 Embed PDI | DONE (PDI+insts in kernels.rs; 100/100 verifier still PASS) | npu-roadmap/2026-05-02 |
 | 1.3a Engine wiring (NpuRuntime API) | DONE (smoke PASS, gated HIPFIRE_NPU_DEQUANT) | npu-roadmap/2026-05-02 |
-| 1.3b Shadow-mode (cask.rs::eviction_step) | next up | feat/npu-stage-1.3b-shadow |
+| 1.3b Shadow harness (1024 dispatches, scale) | DONE (max ULP 3, mean +0.71, all layers PASS) | npu-roadmap/2026-05-02 |
+| 1.5 Bench (baseline + NPU + prefetch + quality) | next up | feat/npu-stage-1.5-bench |
 | 1.5 Bench | blocked on 1.3 | feat/npu-stage-1.5-bench |
 | 2.6 Fused score | blocked on 1.5 | feat/npu-stage-2.6-fused-score |
 | LUT-based bit-exact verifier (deferred) | future work | -- |
@@ -40,3 +41,4 @@ Plan:
 - 2026-05-02 stage 1.2 DONE: ASYM3_DEQUANT_256_{PDI,INSTS} added to crates/hipx/src/kernels.rs. Verifier defaults to embedded; ASYM3_PDI / ASYM3_INSTS env vars override with file paths for kernel-rebuild iteration. Committed binary artifacts (PDI 2784 B, insts 420 B). 100/100 seeds still PASS on hipx with embedded PDI. Next: stage 1.3 engine wiring under HIPFIRE_NPU_DEQUANT flag.
 - 2026-05-02 codex stop-time review caught self-consistent-wrong-kernel hole in verifier: calibration was both observer and oracle. Three fixes: (1) random-seed CPU reference uses engine codebook directly, never calibrated; (2) calibrate_codebook hard-fails on engine-codebook divergence; (3) new calibrate_varied_idx (idx = tid % 8 across 32 threads) catches per-thread permutation bugs. Real ULP envelope without self-consistency: max 3, mean +0.7. Bounds widened to (4, 1.0) with 1 ULP headroom. 100/100 PASS at the corrected gate.
 - 2026-05-02 stage 1.3a DONE: NpuRuntime::asym3_dequant_256 lazy-init pattern (mirrors matmul_i8_1024). route() gates KvCodec on TWO conditions: kernel availability + HIPFIRE_NPU_DEQUANT=1 env. hipfire_x_asym3_dequant smoke test calls the new engine API for k=0..7 patterns; all outputs match engine codebook within 1 ULP (well inside 4-ULP envelope). Stage 1.3b (shadow mode against cask.rs::eviction_step on real prompts) is next.
+- 2026-05-02 stage 1.3b DONE: hipfire_x_asym3_shadow heavy-load harness — 16 layers x 8 heads x 8 positions = 1024 dispatches with realistic varied (cnorm, packed). Max ULP 3 across ALL layers (no per-layer drift), mean signed +0.71 ULP, sampled determinism PASS, 1024 dispatches in 69 ms (~67 µs/dispatch steady-state). Per-layer summary logged to bench/shadow-<timestamp>.tsv. Stage 1.3 fully closed. Stage 1.5 baseline + bench is next.
