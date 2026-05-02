@@ -60,6 +60,53 @@ aie2p scalar libm. If actual is 200 cycles, projection becomes
 ~115 ms/token (1.7x slower than iGPU). The actual number could
 land anywhere in this range.
 
+## Key reformulation: eliminate per-iter atan2 + cos
+
+The iGPU kernel computes:
+  k_phase = atan2(k_im, k_re)
+  angle = omega*p_q + c_phase - k_phase
+  s_trig += c_mag * k_mag * cos(angle)
+
+Apply cos(A-B) = cos(A)cos(B) + sin(A)sin(B):
+  cos(angle) = cos(omega*p_q + c_phase) * cos(k_phase)
+             + sin(omega*p_q + c_phase) * sin(k_phase)
+
+And cos(k_phase) = k_re / k_mag, sin(k_phase) = k_im / k_mag.
+So:
+  k_mag * cos(angle) = cos(omega*p_q + c_phase) * k_re
+                     + sin(omega*p_q + c_phase) * k_im
+
+The k_mag and k_phase BOTH disappear from the s_trig term:
+  s_trig += c_mag * (cos_a[f] * k_re + sin_a[f] * k_im)
+
+where cos_a[f] = cos(omega[f]*p_q + c_phase[f]) and similarly
+sin_a[f] depend ONLY on (f, p_q), not on (head, pos). Per
+dispatch (one decode step) p_q is constant, so cos_a and sin_a
+are computed ONCE on the host (128 trig pairs total), then
+shipped to the NPU as a 2 * 128 = 256 f32 input vector.
+
+The per-(head, pos) compute on NPU becomes:
+  - Dequant 256 indices to v[256]                     ~128 cycles SIMD
+  - Givens: 768 scalar ops -> 48 SIMD-16 ops          ~48 cycles
+  - k_mag = sqrt(k_re*k_re + k_im*k_im) per band      ~64 cycles SIMD
+  - s_trig accumulate: 4 mul + 1 add per band x 128   ~32 cycles SIMD
+  - s_norm: 5 ops per band x 128                      ~40 cycles SIMD
+  - Reduce 128 partial sums                           ~10 cycles
+  Total: ~322 cycles per (head, pos), zero trig
+
+At 32 cores, 32768 iters per layer, 1.6 GHz:
+  per-layer compute = 32768 * 322 / 32 / 1.6e9 = 205 us
+  per-dispatch = 205 us + 0.5 ms host overhead = 0.7 ms
+  per-token (46 layers) = 32 ms
+  vs iGPU 67 ms = 2.1x faster (52% lift)
+
+Even at 2x pessimistic (real memory latency, ObjectFifo overhead):
+  per-token = 64 ms = on par with iGPU
+
+Either way, this is the path to real lift. The reformulation is
+mathematically equivalent (modulo float roundoff) and the parity
+test will catch any divergence from the iGPU reference.
+
 ## Mitigation: precompute angle LUT
 
 If trig is too slow, observe that omega(f) is per-band-only
