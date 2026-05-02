@@ -290,3 +290,38 @@ pub mod asym3_dequant_256_args {
     pub const CNORM: usize = BO1;   // 4 B    (one f32 magnitude factor)
     pub const OUT: usize = BO2;     // 512 B  (256 bf16 dequanted K elements)
 }
+
+/// asym3_dequant_layer — per-layer batched asym3 dequant. Stage 1.4
+/// MVP variant. Single dispatch covers `N_ITERS` (head, position)
+/// pairs sharing the kernel binary; compute is identical to
+/// `asym3_dequant_256` per iteration. Hardcoded N_ITERS=32 for the
+/// MVP iteration; scale up + multi-core fan-out follows.
+///
+/// Layout per dispatch:
+///   packed: N_ITERS * 96 bytes  (indices, contiguous per iter)
+///   cnorm:  N_ITERS * 4  bytes  (one f32 per iter)
+///   out:    N_ITERS * 512 bytes (256 bf16 per iter)
+pub const ASYM3_DEQUANT_LAYER_PDI: &[u8] =
+    include_bytes!("../../../kernels/aie2p/asym3_dequant_layer/build/main.pdi");
+
+pub const ASYM3_DEQUANT_LAYER_INSTS: &[u8] =
+    include_bytes!("../../../kernels/aie2p/asym3_dequant_layer/build/insts.bin");
+
+pub const ASYM3_DEQUANT_LAYER_KERNEL_ID: u32 = 0x902;
+pub const ASYM3_DEQUANT_LAYER_OPS_PER_CYCLE: u32 = 2048;
+pub const ASYM3_DEQUANT_LAYER_COLUMNS: u32 = 8;
+pub const ASYM3_DEQUANT_LAYER_HEAD_DIM: usize = 256;
+pub const ASYM3_DEQUANT_LAYER_N_ITERS: usize = 32;
+pub const ASYM3_DEQUANT_LAYER_PACKED_BYTES: usize =
+    ASYM3_DEQUANT_LAYER_N_ITERS * 96;
+pub const ASYM3_DEQUANT_LAYER_CNORM_BYTES: usize =
+    ASYM3_DEQUANT_LAYER_N_ITERS * 4;
+pub const ASYM3_DEQUANT_LAYER_OUT_BYTES: usize =
+    ASYM3_DEQUANT_LAYER_N_ITERS * 512;
+
+pub mod asym3_dequant_layer_args {
+    pub use super::passthrough_4k_args::*;
+    pub const PACKED: usize = BO0;  // N_ITERS * 96 B    (packed 3-bit indices)
+    pub const CNORM: usize = BO1;   // N_ITERS * 4  B    (per-iter f32 cnorm)
+    pub const OUT: usize = BO2;     // N_ITERS * 512 B   (per-iter 256 bf16)
+}
