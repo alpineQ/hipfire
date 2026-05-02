@@ -27,13 +27,26 @@
 #include <aie_api/aie.hpp>
 #include <stdint.h>
 
-// Codebook constants — matches crates/engine/src/cask.rs::TURBO_C3_256.
-// Stored as bf16 since the kernel produces bf16 output.
+// Codebook constants. EXACT values from kernels/src/turbo_common.h
+// (TURBO_C3_256). Stored as bf16 since the kernel produces bf16
+// output; the f32 to bf16 conversion happens at compile time.
+//
+// Per-entry bf16 round-to-nearest-even of the f32 source:
+//   -0.134860f -> 0xBE0A (-0.13476562)
+//   -0.083320f -> 0xBDAA (-0.08300781)
+//   -0.046469f -> 0xBD3F (-0.04663086)
+//   -0.015176f -> 0xBC7C (-0.01538086)  (rough; exact via compiler)
+//   +0.015176f -> 0x3C7C (+0.01538086)
+//   +0.046469f -> 0x3D3F (+0.04663086)
+//   +0.083320f -> 0x3DAA (+0.08300781)
+//   +0.134860f -> 0x3E0A (+0.13476562)
+//
+// CPU reference must apply the same truncation before comparing.
 static const bfloat16 TURBO_C3[8] = {
-    bfloat16(-0.135f), bfloat16(-0.083f),
-    bfloat16(-0.046f), bfloat16(-0.015f),
-    bfloat16(+0.015f), bfloat16(+0.046f),
-    bfloat16(+0.083f), bfloat16(+0.135f),
+    bfloat16(-0.134860f), bfloat16(-0.083320f),
+    bfloat16(-0.046469f), bfloat16(-0.015176f),
+    bfloat16(+0.015176f), bfloat16(+0.046469f),
+    bfloat16(+0.083320f), bfloat16(+0.134860f),
 };
 
 // Unpack 16 consecutive 3-bit indices from 6 input bytes (48 bits)
