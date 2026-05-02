@@ -215,6 +215,13 @@ fn main() -> ExitCode {
     let mut packed_bo = hipx_dev.alloc_shmem(PACKED_BYTES).expect("packed alloc");
     let mut cnorm_bo = hipx_dev.alloc_shmem(CNORM_BYTES).expect("cnorm alloc");
     let mut out_bo = hipx_dev.alloc_shmem(OUT_BYTES).expect("out alloc");
+    // First map+sync so host_ptr is populated before we capture VAs.
+    { let _ = packed_bo.map().expect("packed map prime"); }
+    let _ = packed_bo.sync(SYNC_TO_DEVICE);
+    { let _ = cnorm_bo.map().expect("cnorm map prime"); }
+    let _ = cnorm_bo.sync(SYNC_TO_DEVICE);
+    { let _ = out_bo.map().expect("out map prime"); }
+    let _ = out_bo.sync(SYNC_TO_DEVICE);
     let packed_va = packed_bo.host_ptr().unwrap() as u64;
     let cnorm_va = cnorm_bo.host_ptr().unwrap() as u64;
     let out_va = out_bo.host_ptr().unwrap() as u64;
