@@ -210,6 +210,49 @@ fn cpu_reference(packed: &[u8], cnorm: f32, out_bf16: &mut [u16]) {
     }
 }
 
+/// ULP distance between two same-sign bf16 values. For our use case
+/// CPU and NPU outputs are always close enough to be same-sign and
+/// same-or-adjacent-exponent, where the bit patterns are monotonic
+/// in magnitude. Treats the bit difference as ULP count.
+fn ulp_distance(a: u16, b: u16) -> u32 {
+    let sa = a & 0x8000;
+    let sb = b & 0x8000;
+    if sa == sb {
+        let mag_a = (a & 0x7fff) as i32;
+        let mag_b = (b & 0x7fff) as i32;
+        (mag_a - mag_b).unsigned_abs()
+    } else {
+        // Cross-zero (one positive, one negative). Distance through
+        // zero in bf16-bit-count terms.
+        let mag_a = (a & 0x7fff) as u32;
+        let mag_b = (b & 0x7fff) as u32;
+        mag_a + mag_b
+    }
+}
+
+/// Signed ULP delta: (npu - cpu) measured in bf16 ULP units, with
+/// magnitude direction. Positive when |npu| > |cpu|.
+fn signed_ulp_delta(cpu: u16, npu: u16) -> i32 {
+    let sc = cpu & 0x8000;
+    let sn = npu & 0x8000;
+    let mag_c = (cpu & 0x7fff) as i32;
+    let mag_n = (npu & 0x7fff) as i32;
+    if sc == sn {
+        mag_n - mag_c
+    } else {
+        mag_n + mag_c
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+struct SeedReport {
+    max_ulp: u32,
+    sum_signed_ulp: i64,
+    n_diff: usize,
+    determ_ok: bool,
+    first_diff: Option<(usize, u16, u16, u32)>,  // dim, cpu, npu, ulp
+}
+
 fn run_one_seed(
     seed: u64,
     hipx_dev: &Hipx,
@@ -218,7 +261,7 @@ fn run_one_seed(
     pdi_len: usize,
     insts_len: usize,
     calibrated_cb: Option<&[u16; 8]>,
-) -> Result<(usize, Option<(usize, u16, u16)>), Box<dyn std::error::Error>> {
+) -> Result<SeedReport, Box<dyn std::error::Error>> {
     let _ = (pdi_len, insts_len); // metadata, unused at this layer
 
     let mut rng = XorShift64::new(seed);
@@ -293,35 +336,62 @@ fn run_one_seed(
     }
     let _ = cmd_bo.sync(SYNC_TO_DEVICE);
 
-    let seq = submit_exec_cmd(
-        hipx_dev.device.fd,
-        ctx,
-        &[&cmd_bo],
-        &[instr_bo, &packed_bo, &cnorm_bo, &out_bo, &bo3, &bo4],
-    )?;
-    timeline_wait(hipx_dev.device.fd, ctx.syncobj_handle, seq, Duration::from_secs(5))?;
-    let _ = out_bo.sync(SYNC_FROM_DEVICE);
+    // Determinism: dispatch twice, compare run-to-run.
+    let mut npu_run1 = vec![0u16; HEAD_DIM];
+    let mut npu_run2 = vec![0u16; HEAD_DIM];
+    for run_idx in 0..2 {
+        // Reset cmd state nibble for re-execution.
+        {
+            let cbuf = cmd_bo.map()?;
+            hipx::ert::reset_state(&mut cbuf[..4]);
+        }
+        let _ = cmd_bo.sync(SYNC_TO_DEVICE);
+        // Reset output sentinel.
+        {
+            let buf = out_bo.map()?;
+            for b in buf[..OUT_BYTES].iter_mut() { *b = 0xCC; }
+        }
+        let _ = out_bo.sync(SYNC_TO_DEVICE);
 
-    // Compare bf16-by-bf16
-    let outp = out_bo.map()?;
-    let mut diffs = 0usize;
-    let mut first_diff: Option<(usize, u16, u16)> = None;
+        let seq = submit_exec_cmd(
+            hipx_dev.device.fd,
+            ctx,
+            &[&cmd_bo],
+            &[instr_bo, &packed_bo, &cnorm_bo, &out_bo, &bo3, &bo4],
+        )?;
+        timeline_wait(hipx_dev.device.fd, ctx.syncobj_handle, seq, Duration::from_secs(5))?;
+        let _ = out_bo.sync(SYNC_FROM_DEVICE);
+        let outp = out_bo.map()?;
+        let dst = if run_idx == 0 { &mut npu_run1 } else { &mut npu_run2 };
+        for d in 0..HEAD_DIM {
+            let lo = outp[d * 2] as u16;
+            let hi = outp[d * 2 + 1] as u16;
+            dst[d] = lo | (hi << 8);
+        }
+    }
+    let determ_ok = npu_run1 == npu_run2;
+
+    // Build report against run 1 as the canonical NPU output.
+    let mut report = SeedReport::default();
+    report.determ_ok = determ_ok;
     for d in 0..HEAD_DIM {
-        let lo = outp[d * 2] as u16;
-        let hi = outp[d * 2 + 1] as u16;
-        let npu_bits = lo | (hi << 8);
         let cpu_bits = cpu_out[d];
+        let npu_bits = npu_run1[d];
         if npu_bits != cpu_bits {
-            diffs += 1;
-            if first_diff.is_none() {
-                first_diff = Some((d, cpu_bits, npu_bits));
+            let ulp = ulp_distance(cpu_bits, npu_bits);
+            let signed = signed_ulp_delta(cpu_bits, npu_bits) as i64;
+            report.n_diff += 1;
+            report.sum_signed_ulp += signed;
+            if ulp > report.max_ulp { report.max_ulp = ulp; }
+            if report.first_diff.is_none() {
+                report.first_diff = Some((d, cpu_bits, npu_bits, ulp));
             }
         }
     }
 
-    // On mismatch, optionally dump diagnostic info if env set.
-    if diffs > 0 && std::env::var("ASYM3_DEBUG").is_ok() {
-        if let Some((d, cpu_bits, npu_bits)) = first_diff {
+    // On large divergence, optionally dump diagnostic info.
+    if report.max_ulp > 0 && std::env::var("ASYM3_DEBUG").is_ok() {
+        if let Some((d, cpu_bits, npu_bits, ulp)) = report.first_diff {
             let tid = d / 8;
             let i = d % 8;
             let base = tid * 3;
@@ -330,22 +400,20 @@ fn run_one_seed(
                 | ((packed[base + 2] as u32) << 16);
             let idx = ((word >> (i * 3)) & 7) as usize;
             let cb_f32 = TURBO_C3_256[idx];
-            let cb_bf16 = f32_to_bf16_bits(cb_f32);
-            let cnorm_bf16 = f32_to_bf16_bits(cnorm);
+            let cb_bf16 = f32_to_bf16_bits_rtz(cb_f32);
+            let cnorm_bf16 = f32_to_bf16_bits_rtz(cnorm);
             let cb_b = bf16_bits_to_f32(cb_bf16);
             let cnorm_b = bf16_bits_to_f32(cnorm_bf16);
             let f32_product = cnorm_b * cb_b;
             let bf16_via_rne = f32_to_bf16_bits(f32_product);
             let bf16_via_trunc = (f32_product.to_bits() >> 16) as u16;
-            let cpu_f = bf16_bits_to_f32(cpu_bits);
-            let npu_f = bf16_bits_to_f32(npu_bits);
             eprintln!(
-                "DEBUG dim {d} (tid {tid} i {i}) idx={idx} cb=0x{cb_bf16:04x}({cb_b:.7}) cnorm=0x{cnorm_bf16:04x}({cnorm_b:.7}) f32_prod={f32_product:.10} via_rne=0x{bf16_via_rne:04x} via_trunc=0x{bf16_via_trunc:04x} cpu=0x{cpu_bits:04x}({cpu_f:.7}) npu=0x{npu_bits:04x}({npu_f:.7})"
+                "DEBUG dim {d} (tid {tid} i {i}) idx={idx} cb=0x{cb_bf16:04x} cnorm=0x{cnorm_bf16:04x} f32_prod={f32_product:.10} via_rne=0x{bf16_via_rne:04x} via_trunc=0x{bf16_via_trunc:04x} cpu=0x{cpu_bits:04x} npu=0x{npu_bits:04x} ulp={ulp}"
             );
         }
     }
 
-    Ok((diffs, first_diff))
+    Ok(report)
 }
 
 /// Encode 32 threads × 8 indices = 256 values all set to `idx_value`,
@@ -523,30 +591,62 @@ fn main() -> ExitCode {
         }
     } else { None };
 
-    // Run N seeds, accumulate failures.
-    let mut total_clean = 0usize;
-    let mut total_dirty = 0usize;
-    let mut first_failing: Option<(u64, usize, u16, u16)> = None;
+    // Stage 1.1 acceptance gates (per docs/plans/aie2p-bf16-mul-shape.md):
+    //
+    //   1. Determinism: same input -> same output across two consecutive
+    //      dispatches. 100/100 seeds.
+    //   2. Max ULP bound: max bf16 ULP deviation per element across all
+    //      seeds <= MAX_ULP_BOUND. Catches structural bugs (codebook,
+    //      layout, unpack) which produce errors much larger than the
+    //      AIE-2P-shape rounding floor of ~2 ULP.
+    //   3. Statistical: |mean signed ULP error| <= MEAN_BIAS_BOUND.
+    //      Catches systematic drift bugs.
+    //
+    // ASYM3_STRICT=1: enforce true bit-for-bit (max_ulp == 0). Used for
+    // future LUT-based verifier / kernel revision tests.
+    let strict = std::env::var("ASYM3_STRICT").is_ok();
+    let max_ulp_bound: u32 = if strict { 0 } else { 2 };
+    let mean_bias_bound: f64 = if strict { 0.0 } else { 0.5 };
+
+    let mut total_seeds_ok = 0usize;
+    let mut total_seeds_fail = 0usize;
+    let mut grand_max_ulp: u32 = 0;
+    let mut grand_sum_signed: i64 = 0;
+    let mut grand_n_diff: usize = 0;
+    let mut all_determ = true;
+    let mut first_failure_msg: Option<String> = None;
 
     for s in 0..n_seeds {
         let seed = 0x1000_0001u64.wrapping_add(s as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         match run_one_seed(seed, &hipx_dev, &ctx, &instr_bo, pdi.len(), insts.len(),
                            calibrated_cb.as_ref()) {
-            Ok((0, _)) => {
-                total_clean += 1;
-                if s < 3 {
-                    println!("  seed {seed:#018x}: clean (256 bf16 match)");
+            Ok(r) => {
+                if !r.determ_ok {
+                    all_determ = false;
+                    let msg = format!("seed {seed:#018x}: NON-DETERMINISTIC (run1 != run2)");
+                    if first_failure_msg.is_none() { first_failure_msg = Some(msg.clone()); }
+                    eprintln!("  {msg}");
                 }
-            }
-            Ok((n, fd)) => {
-                total_dirty += 1;
-                let label = fd.map(|(d, c, g)| {
-                    format!("first diff at dim {d}: cpu={c:#06x} npu={g:#06x}")
-                }).unwrap_or_default();
-                println!("  seed {seed:#018x}: {n}/{HEAD_DIM} bf16 mismatches; {label}");
-                if first_failing.is_none() {
-                    if let Some((d, c, g)) = fd {
-                        first_failing = Some((seed, d, c, g));
+                if r.max_ulp > grand_max_ulp { grand_max_ulp = r.max_ulp; }
+                grand_sum_signed += r.sum_signed_ulp;
+                grand_n_diff += r.n_diff;
+
+                let seed_pass = r.determ_ok && r.max_ulp <= max_ulp_bound;
+                if seed_pass {
+                    total_seeds_ok += 1;
+                    if s < 3 {
+                        println!("  seed {seed:#018x}: PASS (max_ulp={}, n_diff={}/{HEAD_DIM})",
+                                 r.max_ulp, r.n_diff);
+                    }
+                } else {
+                    total_seeds_fail += 1;
+                    let label = r.first_diff.map(|(d, c, g, u)|
+                        format!("first diff at dim {d}: cpu={c:#06x} npu={g:#06x} ulp={u}")
+                    ).unwrap_or_default();
+                    println!("  seed {seed:#018x}: FAIL max_ulp={} (>{max_ulp_bound}); {label}",
+                             r.max_ulp);
+                    if first_failure_msg.is_none() {
+                        first_failure_msg = Some(format!("seed {seed:#018x} max_ulp={} bound={max_ulp_bound}", r.max_ulp));
                     }
                 }
             }
@@ -557,14 +657,35 @@ fn main() -> ExitCode {
         }
     }
 
-    println!("\n=== {} clean / {} dirty across {} seeds ===",
-             total_clean, total_dirty, n_seeds);
-    if total_dirty == 0 {
+    let mean_signed = if grand_n_diff > 0 {
+        grand_sum_signed as f64 / grand_n_diff as f64
+    } else { 0.0 };
+    let mean_signed_ok = mean_signed.abs() <= mean_bias_bound;
+
+    println!("\n=== Stage 1.1 acceptance gates ===");
+    println!("  determinism:    {} / {} seeds ({})",
+             if all_determ { n_seeds } else { n_seeds - 1 }, n_seeds,
+             if all_determ { "PASS" } else { "FAIL" });
+    println!("  max ULP:        observed {} <= bound {} ({})",
+             grand_max_ulp, max_ulp_bound,
+             if grand_max_ulp <= max_ulp_bound { "PASS" } else { "FAIL" });
+    println!("  mean signed:    {:.4} ULP <= bound {:.2} ({})",
+             mean_signed, mean_bias_bound,
+             if mean_signed_ok { "PASS" } else { "FAIL" });
+    println!("  per-seed:       {} pass, {} fail across {} seeds",
+             total_seeds_ok, total_seeds_fail, n_seeds);
+    println!("  mode:           {} (set ASYM3_STRICT=1 for bit-for-bit)",
+             if strict { "strict bit-for-bit" } else { "AIE-2P-shape (<=2 ULP)" });
+
+    let pass = all_determ && grand_max_ulp <= max_ulp_bound && mean_signed_ok;
+    if pass {
+        println!("\n=== STAGE 1.1 PASS ===");
         ExitCode::SUCCESS
     } else {
-        if let Some((seed, dim, cpu, npu)) = first_failing {
-            println!("first failing seed {seed:#018x} dim={dim} cpu={cpu:#06x} npu={npu:#06x}");
+        if let Some(msg) = first_failure_msg {
+            println!("\nFIRST FAILURE: {msg}");
         }
+        println!("\n=== STAGE 1.1 FAIL ===");
         ExitCode::FAILURE
     }
 }
