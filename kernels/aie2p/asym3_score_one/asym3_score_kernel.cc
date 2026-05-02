@@ -35,11 +35,23 @@
 #include <aie_api/aie.hpp>
 #include <stdint.h>
 
-// Peano's aie2p math.h only declares fabs/fabsf/fabsl. libm.a
-// has the rest of the symbols but no header. Forward-declare
-// sqrtf so clang++ accepts the call; aiecc links libm.a in the
-// final kernel ELF.
-extern "C" float sqrtf(float);
+// aiecc does not link libm.a by default and __builtin_sqrtf fails
+// to legalize on aie2p. Use a small Newton-Raphson sqrt so the
+// kernel has no libm dependency. Two iterations after the
+// rsqrt bit-trick gets within 0.0005% relative error which is
+// far better than the f32 -> bf16 precision floor we would lose
+// to anyway. SIMD aie::sqrt comes in the optimized variant once
+// the scalar reference is verified.
+static inline float fast_sqrtf(float x) {
+  if (x <= 0.0f) return 0.0f;
+  union { float f; uint32_t i; } u;
+  u.f = x;
+  u.i = 0x5f3759df - (u.i >> 1);  // initial guess for 1/sqrt(x)
+  float y = u.f;
+  y = y * (1.5f - 0.5f * x * y * y);  // NR iter 1
+  y = y * (1.5f - 0.5f * x * y * y);  // NR iter 2
+  return x * y;
+}
 
 // Codebook stays f32 in the score kernel. Unlike asym3_dequant_layer
 // (which writes bf16 K and so must match the AIE-2P bf16 mul-and-store
@@ -67,20 +79,45 @@ unpack_indices_for_thread(const uint8_t *base, int8_t *out8) {
   }
 }
 
+// AIE-2P compute tiles only have 2 input + 2 output DMA channels.
+// To stay within that budget, all per-call inputs are concatenated
+// into a single byte buffer with typed pointer access at fixed
+// offsets. Layout (bytes, total = 3172, padded to 3200 in MLIR):
+//
+//   0    .. 96    packed   (96 B)
+//   96   .. 100   cnorm    (1 f32)
+//   100  .. 612   c_mag    (128 f32)
+//   612  .. 1124  c_abs    (128 f32)
+//   1124 .. 1636  cos_a    (128 f32)
+//   1636 .. 2148  sin_a    (128 f32)
+//   2148 .. 2660  cos_theta(128 f32)
+//   2660 .. 3172  sin_theta(128 f32)
+//
+// This MUST match the host-side layout in the verifier.
+constexpr int OFF_PACKED   = 0;
+constexpr int OFF_CNORM    = 96;
+constexpr int OFF_C_MAG    = 100;
+constexpr int OFF_C_ABS    = 612;
+constexpr int OFF_COS_A    = 1124;
+constexpr int OFF_SIN_A    = 1636;
+constexpr int OFF_COS_T    = 2148;
+constexpr int OFF_SIN_T    = 2660;
+constexpr int INPUT_BYTES  = 3200;
+
 extern "C" {
 
 // Single-(head, position) fused score; n_bands implicitly == 128.
-void asym3_score_one(
-    uint8_t *packed,        // 96 bytes
-    float   *cnorm_ptr,     // 1 f32
-    float   *c_mag,         // 128 f32
-    float   *c_abs,         // 128 f32
-    float   *cos_a,         // 128 f32
-    float   *sin_a,         // 128 f32
-    float   *cos_theta,     // 128 f32
-    float   *sin_theta,     // 128 f32
-    float   *score_out      // 1 f32 output
-) {
+// Single packed input buffer (3200 B) + single output (1 f32).
+void asym3_score_one(uint8_t *input, float *score_out) {
+  uint8_t *packed       = input + OFF_PACKED;
+  float   *cnorm_ptr    = (float*)(input + OFF_CNORM);
+  float   *c_mag        = (float*)(input + OFF_C_MAG);
+  float   *c_abs        = (float*)(input + OFF_C_ABS);
+  float   *cos_a        = (float*)(input + OFF_COS_A);
+  float   *sin_a        = (float*)(input + OFF_SIN_A);
+  float   *cos_theta    = (float*)(input + OFF_COS_T);
+  float   *sin_theta    = (float*)(input + OFF_SIN_T);
+
   // cnorm and codebook stay f32 (no bf16 round-trip): the iGPU
   // reference runs in f32 throughout and the score output is f32,
   // so any bf16 truncation here is pure precision loss with zero
@@ -123,11 +160,7 @@ void asym3_score_one(
 
       // s_norm still needs k_mag.
       float k_mag2 = k_re * k_re + k_im * k_im;
-      // Peano libm scalar sqrtf; SIMD aie::sqrt comes in the
-      // optimized variant once correctness is proven. The
-      // __builtin_sqrtf variant fails to legalize on aie2p
-      // ("unable to legalize instruction: G_FSQRT").
-      float k_mag = sqrtf(k_mag2);
+      float k_mag = fast_sqrtf(k_mag2);
 
       float r = (c_abs[f] > 1e-20f) ? (c_mag[f] / c_abs[f]) : 0.0f;
       if (r > 1.0f) r = 1.0f;
