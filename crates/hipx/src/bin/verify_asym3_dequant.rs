@@ -143,7 +143,7 @@ fn cpu_reference_calibrated(packed: &[u8], cnorm: f32, calibrated_cb: &[u16; 8],
                             out_bf16: &mut [u16]) {
     assert_eq!(packed.len(), PACKED_BYTES);
     assert_eq!(out_bf16.len(), HEAD_DIM);
-    let cnorm_b = bf16_bits_to_f32(f32_to_bf16_bits_rtz(cnorm));
+    let cnorm_b = bf16_bits_to_f32(f32_to_bf16_bits_raz(cnorm));
     let cb_f32: [f32; 8] = std::array::from_fn(|i| bf16_bits_to_f32(calibrated_cb[i]));
     for tid in 0..32 {
         let base = tid * 3;
@@ -186,7 +186,7 @@ fn cpu_reference(packed: &[u8], cnorm: f32, out_bf16: &mut [u16]) {
     // AIE-2P-shape mul: cnorm f32 -> bf16 RTZ -> f32 promote, cb bf16
     // -> f32 promote, f32 multiply, f32 -> bf16 RAZ. See the f32
     // conversion docs above.
-    let cnorm_bf16 = f32_to_bf16_bits_rtz(cnorm);
+    let cnorm_bf16 = f32_to_bf16_bits_raz(cnorm);
     let cnorm_b = bf16_bits_to_f32(cnorm_bf16);
 
     // Codebook bf16 reps confirmed byte-identical between kernel and
