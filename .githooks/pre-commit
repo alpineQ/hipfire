@@ -27,13 +27,18 @@
 
 set -e
 
-# List files staged for this commit.
-CHANGED=$(git diff --cached --name-only --diff-filter=ACM)
+# List files staged for this commit, excluding doc-only paths
+# (docs/, *.md, README*) — these can mention quant/dispatch/etc by topic
+# without touching forward-pass code, so the hotspot regex would
+# false-positive and fire the multi-minute coherence + speed battery on
+# pure documentation commits.
+CHANGED=$(git diff --cached --name-only --diff-filter=ACM \
+    | grep -vE '^docs/|\.md$|^README' || true)
 
 # Hotspots that can affect forward-pass output or speed.
 HOTSPOT='\.hip$|gemv|forward|quant|rotate|dispatch|fwht|rmsnorm|fused|mq4|hfq|magnum|llama\.rs|qwen35\.rs|gemm|wmma'
 
-if ! echo "$CHANGED" | grep -qE "$HOTSPOT"; then
+if [ -z "$CHANGED" ] || ! echo "$CHANGED" | grep -qE "$HOTSPOT"; then
     exit 0
 fi
 
