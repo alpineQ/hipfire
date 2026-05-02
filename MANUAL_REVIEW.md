@@ -1,5 +1,44 @@
 # Manual Review Queue (npu-roadmap/2026-05-02)
 
+## ESCALATED-3: Stage 1.5 NPU dequant offload does not produce a lift
+
+**Stage**: 1.5 (post multi-core scaffolding)
+
+**Status**: Multi-core scaffolding (1c/2c/4c/8c kernels) shipped
+and verified. Measured per-iter compute on Strix Halo AIE-2P is
+1.74 us at N_ITERS=1024 single-core. Linear extrapolation to
+production shape (N_ITERS=32768) projects:
+
+| N_cores | Per-dispatch | Per-token (46 layers) | vs iGPU 67 ms |
+|---------|--------------|------------------------|---------------|
+|    8    |  7.84 ms     |  360 ms                | 5.4x slower   |
+|   16    |  4.30 ms     |  198 ms                | 3.0x slower   |
+|   32    |  2.51 ms     |  115 ms                | 1.7x slower   |
+
+Even fully-utilized 32-core configuration projects 1.7x slower
+than iGPU baseline. The NPU dequant offload alone does not beat
+the iGPU's existing fused dequant + score path.
+
+**Decision** (per contract escalation rule "If lift is < 5% or
+quality drifts: do not flip default. Escalate to MANUAL_REVIEW.md
+with telemetry; stage 2.6 (fused score) may be the right next
+move instead."):
+
+  1. Default `HIPFIRE_NPU_DEQUANT` stays 0.
+  2. Stage 1.5 closes as ESCALATED with this telemetry.
+  3. Stage 2.6 (fused asym3 score on NPU) is the actual perf
+     lever. Eliminates the 16 MiB bf16 K writeback per layer +
+     moves Givens + RoPE + atan2/cos/sin/sqrt off iGPU.
+  4. Multi-core scaffolding from 1.4a is reusable for 2.6.
+
+**Telemetry**: `bench/npu-multicore-scaling-2026-05-02.txt`
+
+**Tasks**: #37 (Stage 1.5) closed as resolved-via-escalation.
+#40 (multi-core) closed; scaffolding shipped, perf path moves to
+#38 (Stage 2.6).
+
+
+
 ## RESOLVED-2: Tighten verifier bounds from (4, 1.0) to (3, 0.5)
 
 Resolved 2026-05-02. The 1000-seed layer verifier shows max ULP 2 /
