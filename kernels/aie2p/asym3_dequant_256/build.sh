@@ -70,14 +70,15 @@ PEANO_INSTALL_DIR="$PEANO" \
     --npu-insts-name=insts.bin \
     "$SRCDIR/aie.mlir"
 
-# Extract PDI + JSON manifests from the xclbin (zip format) so they
-# can be embedded directly via crates/hipx/src/kernels.rs.
+# Copy PDI + JSON manifests from aiecc's project subdir to the
+# top-level build/ so embedding via crates/hipx/src/kernels.rs is
+# straightforward (matches the layout of existing kernels'
+# build/ dirs).
 echo
-echo "[2.5] unzip PDI + JSON from xclbin"
-unzip -o asym3_dequant.xclbin -d _unpacked >/dev/null
-cp _unpacked/main.pdi main.pdi 2>/dev/null || true
-cp _unpacked/main_aie_partition.json main_aie_partition.json 2>/dev/null || true
-cp _unpacked/main_kernels.json main_kernels.json 2>/dev/null || true
+echo "[2.5] copy main.pdi + manifests"
+cp aie.mlir.prj/main.pdi main.pdi
+cp aie.mlir.prj/main_aie_partition.json main_aie_partition.json 2>/dev/null || true
+cp aie.mlir.prj/main_kernels.json main_kernels.json 2>/dev/null || true
 
 echo
 echo "Built artifacts:"
