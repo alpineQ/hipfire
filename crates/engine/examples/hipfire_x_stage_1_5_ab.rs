@@ -24,13 +24,14 @@
 //! Both paths run 100 trials each; reports median + p95 wall clock.
 //! Saves bench/stage-1.5-ab-<ts>.txt per the contract format.
 //!
-//! Build:
-//!   cargo run -p engine --features deltanet --example hipfire_x_stage_1_5_ab
-
-// Requires both `deltanet` (for KvCache::new_gpu_asym3 + TriAttn types)
-// and `npu` (for engine::npu::NpuRuntime, gated behind dep:hipx). Build:
-//   cargo run -p engine --features deltanet,npu --release \
-//     --example hipfire_x_stage_1_5_ab
+//! Build (requires BOTH `deltanet` for KvCache::new_gpu_asym3 +
+//! TriAttn types AND `npu` for engine::npu::NpuRuntime, which is
+//! gated behind dep:hipx). Any other feature combo compiles to a
+//! stub that just prints a "build with --features deltanet,npu"
+//! message.
+//!
+//!   cargo run -p engine --features deltanet,npu --release \
+//!     --example hipfire_x_stage_1_5_ab
 #[cfg(not(all(feature = "deltanet", feature = "npu")))]
 fn main() {
     eprintln!("build with --features deltanet,npu");
