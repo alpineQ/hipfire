@@ -74,6 +74,10 @@ unpack_16_indices(const uint8_t *p, int8_t *out16) {
 // build a mask `indices == e`, then select between the running result
 // and a broadcast of CODEBOOK[e]. After 8 passes every lane has the
 // correct codebook value. Then a single fmul applies cnorm.
+//
+// aie::select(v1, v2, m) computes  out[i] = m[i] == 0 ? v1[i] : v2[i].
+// We want: when mask is set (idx == e), pick code_e; otherwise keep
+// the running result. So v1=result, v2=code_e.
 static inline ::aie::vector<bfloat16, 16>
 lookup_and_scale_16(const ::aie::vector<int8_t, 16> &idx,
                     const ::aie::vector<bfloat16, 16> &cnorm_v) {
@@ -82,7 +86,7 @@ lookup_and_scale_16(const ::aie::vector<int8_t, 16> &idx,
   for (int e = 0; e < 8; ++e) {
     auto mask = ::aie::eq(idx, ::aie::broadcast<int8_t, 16>((int8_t)e));
     auto code_e = ::aie::broadcast<bfloat16, 16>(TURBO_C3[e]);
-    result = ::aie::select(code_e, result, mask);
+    result = ::aie::select(result, code_e, mask);
   }
   return ::aie::mul(result, cnorm_v).template to_vector<bfloat16>();
 }
