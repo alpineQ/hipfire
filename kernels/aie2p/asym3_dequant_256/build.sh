@@ -39,13 +39,15 @@ fi
 mkdir -p build
 
 # Step 1 — Compile the C++ kernel into an AIE-2P object file.
-echo "[1/2] clang --target=aie2p-none-unknown-elf -c asym3_dequant_kernel.cc"
-"$PEANO/bin/clang" \
+# Flags mirror PEANOWRAP2P_FLAGS from mlir-aie/programming_examples/makefile-common.
+echo "[1/2] clang++ --target=aie2p-none-unknown-elf -std=c++20 -c asym3_dequant_kernel.cc"
+"$PEANO/bin/clang++" \
     -O2 \
+    -std=c++20 \
     --target=aie2p-none-unknown-elf \
     -Wno-parentheses -Wno-attributes -Wno-macro-redefined \
     -DNDEBUG \
-    -I"$MLIR_AIE_INC" \
+    -I "$MLIR_AIE_INC" \
     -c asym3_dequant_kernel.cc \
     -o build/asym3_dequant_kernel.o
 
