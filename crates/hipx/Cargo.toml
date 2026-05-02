@@ -62,6 +62,10 @@ name = "hipx-matmul-i8-512-32c"
 path = "src/bin/matmul_i8_512_32c.rs"
 
 [[bin]]
+name = "hipx-matmul-i8-1024-32c"
+path = "src/bin/matmul_i8_1024_32c.rs"
+
+[[bin]]
 name = "hipx-matmul-bf16"
 path = "src/bin/matmul_bf16.rs"
 
