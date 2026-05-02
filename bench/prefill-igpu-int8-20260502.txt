@@ -1,0 +1,25 @@
+GPU: gfx1151 (103.1 GB VRAM, HIP 7.2)
+# bench_int8_gemm_prefill
+# arch: gfx1151
+# timestamp: 1777759218
+
+# columns: shape | batch | iters | ms_total | ms_per_op | tops
+
+27b-attn-proj-4608x4608        | bs=  32 | iters=100 | ms_total=  27.284 | ms/op=  0.2728 | TOp/s=  4.98
+27b-attn-proj-4608x4608        | bs=  64 | iters=100 | ms_total=  29.517 | ms/op=  0.2952 | TOp/s=  9.21
+27b-attn-proj-4608x4608        | bs= 128 | iters=100 | ms_total=  26.583 | ms/op=  0.2658 | TOp/s= 20.45
+27b-attn-proj-4608x4608        | bs= 256 | iters=100 | ms_total=  51.834 | ms/op=  0.5183 | TOp/s= 20.97
+27b-attn-proj-4608x4608        | bs= 512 | iters=100 | ms_total= 103.744 | ms/op=  1.0374 | TOp/s= 20.96
+
+27b-ffn-down-4608x18432        | bs=  32 | iters=100 | ms_total= 121.841 | ms/op=  1.2184 | TOp/s=  4.46
+27b-ffn-down-4608x18432        | bs=  64 | iters=100 | ms_total= 130.615 | ms/op=  1.3062 | TOp/s=  8.32
+27b-ffn-down-4608x18432        | bs= 128 | iters=100 | ms_total= 122.736 | ms/op=  1.2274 | TOp/s= 17.72
+27b-ffn-down-4608x18432        | bs= 256 | iters=100 | ms_total= 247.118 | ms/op=  2.4712 | TOp/s= 17.60
+27b-ffn-down-4608x18432        | bs= 512 | iters=100 | ms_total= 500.833 | ms/op=  5.0083 | TOp/s= 17.37
+
+27b-ffn-gate+up-36864x4608     | bs=  32 | iters=100 | ms_total= 247.429 | ms/op=  2.4743 | TOp/s=  4.39
+27b-ffn-gate+up-36864x4608     | bs=  64 | iters=100 | ms_total= 267.593 | ms/op=  2.6759 | TOp/s=  8.13
+27b-ffn-gate+up-36864x4608     | bs= 128 | iters=100 | ms_total= 240.654 | ms/op=  2.4065 | TOp/s= 18.07
+27b-ffn-gate+up-36864x4608     | bs= 256 | iters=100 | ms_total= 449.190 | ms/op=  4.4919 | TOp/s= 19.36
+27b-ffn-gate+up-36864x4608     | bs= 512 | iters=100 | ms_total= 871.216 | ms/op=  8.7122 | TOp/s= 19.97
+
