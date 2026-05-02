@@ -261,3 +261,32 @@ pub mod matmul_bf16_1024_4c_args {
     pub const B: usize = BO1;     // 2 097 152 B   (K*N*bf16)
     pub const C: usize = BO2;     // 4 194 304 B   (M*N*f32)
 }
+
+/// asym3_dequant_256 — single-head asym3 K cache dequant kernel for
+/// 27B Gemma (head_dim=256). Maps `[4-byte cnorm | 96-byte packed
+/// 3-bit indices]` from `kernels/src/turbo_common.h::TURBO_C3_256`
+/// to 256 bf16 values per call. Single-core single-column.
+///
+/// Stage 1.1 verified to ULP-bounded (<= 2 bf16 ULP per element)
+/// against an AIE-2P-shape CPU reference (RTZ cnorm, RAZ output).
+/// See docs/plans/aie2p-bf16-mul-shape.md for the hardware-shape
+/// characterization.
+pub const ASYM3_DEQUANT_256_PDI: &[u8] =
+    include_bytes!("../../../kernels/aie2p/asym3_dequant_256/build/main.pdi");
+
+pub const ASYM3_DEQUANT_256_INSTS: &[u8] =
+    include_bytes!("../../../kernels/aie2p/asym3_dequant_256/build/insts.bin");
+
+pub const ASYM3_DEQUANT_256_KERNEL_ID: u32 = 0x901;
+pub const ASYM3_DEQUANT_256_OPS_PER_CYCLE: u32 = 2048;
+pub const ASYM3_DEQUANT_256_COLUMNS: u32 = 8;
+pub const ASYM3_DEQUANT_256_HEAD_DIM: usize = 256;
+pub const ASYM3_DEQUANT_256_PACKED_BYTES: usize = 96;
+pub const ASYM3_DEQUANT_256_OUT_BYTES: usize = 512;
+
+pub mod asym3_dequant_256_args {
+    pub use super::passthrough_4k_args::*;
+    pub const PACKED: usize = BO0;  // 96 B   (32 threads x 3 bytes packed indices)
+    pub const CNORM: usize = BO1;   // 4 B    (one f32 magnitude factor)
+    pub const OUT: usize = BO2;     // 512 B  (256 bf16 dequanted K elements)
+}

@@ -12,9 +12,10 @@
 //! bytes, same cnorm, same codebook, must produce identical bf16
 //! values. Any tolerance is a bug.
 //!
-//! Stage 1.1 PDI loading is from disk (kernels/aie2p/asym3_dequant_256/
-//! build/aie.mlir.prj/{main.pdi,insts.bin}). Stage 1.2 will switch to
-//! include_bytes!.
+//! Stage 1.2 onward: PDI + insts ship via `include_bytes!` from
+//! `crates/hipx/src/kernels.rs::ASYM3_DEQUANT_256_*`. The
+//! ASYM3_PDI / ASYM3_INSTS env vars override with file-loaded
+//! variants (useful for testing kernel rebuilds before re-cargo).
 //!
 //! Build:
 //!   cargo build -p hipx --bin verify_asym3_dequant
@@ -43,17 +44,29 @@ const TURBO_C3_256: [f32; 8] = [
      0.015176,  0.046469,  0.083320,  0.134860,
 ];
 
-// Path-from-CWD constants. Verifier expects to be run from the repo
-// root; if not, prefixes resolve via env.
-fn pdi_path() -> String {
-    std::env::var("ASYM3_PDI").unwrap_or_else(|_| {
-        "kernels/aie2p/asym3_dequant_256/build/aie.mlir.prj/main.pdi".into()
-    })
+/// Load PDI: ASYM3_PDI env path overrides; otherwise the embedded
+/// `ASYM3_DEQUANT_256_PDI` from `hipx::kernels`.
+fn load_pdi() -> Vec<u8> {
+    if let Ok(p) = std::env::var("ASYM3_PDI") {
+        std::fs::read(&p).unwrap_or_else(|e| {
+            eprintln!("ASYM3_PDI={p} read failed: {e}");
+            std::process::exit(1);
+        })
+    } else {
+        hipx::kernels::ASYM3_DEQUANT_256_PDI.to_vec()
+    }
 }
-fn insts_path() -> String {
-    std::env::var("ASYM3_INSTS").unwrap_or_else(|_| {
-        "kernels/aie2p/asym3_dequant_256/build/insts.bin".into()
-    })
+
+/// Load insts: ASYM3_INSTS env path overrides; otherwise embedded.
+fn load_insts() -> Vec<u8> {
+    if let Ok(p) = std::env::var("ASYM3_INSTS") {
+        std::fs::read(&p).unwrap_or_else(|e| {
+            eprintln!("ASYM3_INSTS={p} read failed: {e}");
+            std::process::exit(1);
+        })
+    } else {
+        hipx::kernels::ASYM3_DEQUANT_256_INSTS.to_vec()
+    }
 }
 
 // xorshift64 PRNG so seeds are reproducible without a dep.
@@ -525,14 +538,8 @@ fn main() -> ExitCode {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SEEDS);
 
-    let pdi = match std::fs::read(pdi_path()) {
-        Ok(b) => b,
-        Err(e) => { eprintln!("read PDI {}: {e}", pdi_path()); return ExitCode::FAILURE; }
-    };
-    let insts = match std::fs::read(insts_path()) {
-        Ok(b) => b,
-        Err(e) => { eprintln!("read insts {}: {e}", insts_path()); return ExitCode::FAILURE; }
-    };
+    let pdi = load_pdi();
+    let insts = load_insts();
 
     println!("[verify] PDI {} bytes; insts {} bytes; {n_seeds} seeds",
              pdi.len(), insts.len());
