@@ -143,6 +143,7 @@ name = "hipx"
 version = "0.1.8-alpha.2"
 dependencies = [
  "libc",
+ "libloading",
 ]
 
 [[package]]
