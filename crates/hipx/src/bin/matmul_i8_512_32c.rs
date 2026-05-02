@@ -73,28 +73,37 @@ fn main() -> ExitCode {
     let _ = instr_bo.sync(SYNC_TO_DEVICE);
     let ninstr_dwords = (MATMUL_I8_512_32C_INSTS.len() / 4) as u32;
 
-    // Position-encoded inputs with asymmetric prime mixing on (r, kk) and
-    // (kk, c) so the resulting c[r, c] is unique per output position. The
-    // prior (r+kk)&3 / (kk+c)&3 pattern was shift-invariant -- c[r, c] only
-    // depended on (c - r) mod period -- so a tile-remap bug that swapped
-    // diagonal-equal outputs would still pass. With distinct mixing
-    // constants on r vs kk vs c, the shift symmetry is broken and any
-    // (m, n) tile permutation is detectable.
+    // Pseudo-random inputs via Knuth multiplicative hash on the full
+    // (r, kk) / (kk, c) position index. Prior attempts had two flaws:
+    //   1. (r+kk)&3 made c[r, c] depend only on (c - r) mod period.
+    //   2. Linear `(17r + 5kk) & 7` collapsed to (r + 5kk) mod 8 since
+    //      17 mod 8 = 1 -- so c[r, c] had period 8 independently in r
+    //      and c, and any tile remap by multiples of 8 would still pass.
     //
-    // Range stays in [-2, 2] so accumulator |sum| <= 2 * 2 * 512 = 2048,
-    // far inside i32.
+    // Knuth's golden-ratio constant 0x9E3779B97F4A7C15 multiplied by the
+    // position index, taking the high 3 bits, yields values in [-4, 3]
+    // that are a function of the FULL idx (not just low bits). The
+    // distribution has no small-period invariance, so any (m, n) tile
+    // permutation produces visible mismatches. Range keeps accumulator
+    // |sum| <= 4 * 4 * 512 = 8192, well within i32.
+    fn pseudo_i8(idx: u64) -> i8 {
+        let h = idx.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        ((h >> 61) as i8) - 4
+    }
     let mut a_host = vec![0i8; MATMUL_I8_512_32C_M * MATMUL_I8_512_32C_K];
     for r in 0..MATMUL_I8_512_32C_M {
         for kk in 0..MATMUL_I8_512_32C_K {
-            let v = ((r.wrapping_mul(17).wrapping_add(kk.wrapping_mul(5))) & 0x7) as i32 - 4;
-            a_host[r * MATMUL_I8_512_32C_K + kk] = v as i8;
+            let idx = (r * MATMUL_I8_512_32C_K + kk) as u64;
+            a_host[r * MATMUL_I8_512_32C_K + kk] = pseudo_i8(idx);
         }
     }
+    // Offset B's hash space so a and b values are independent.
+    let b_offset = (MATMUL_I8_512_32C_M * MATMUL_I8_512_32C_K) as u64;
     let mut b_host = vec![0i8; MATMUL_I8_512_32C_K * MATMUL_I8_512_32C_N];
     for kk in 0..MATMUL_I8_512_32C_K {
         for c in 0..MATMUL_I8_512_32C_N {
-            let v = ((kk.wrapping_mul(11).wrapping_add(c.wrapping_mul(3))) & 0x7) as i32 - 4;
-            b_host[kk * MATMUL_I8_512_32C_N + c] = v as i8;
+            let idx = b_offset + (kk * MATMUL_I8_512_32C_N + c) as u64;
+            b_host[kk * MATMUL_I8_512_32C_N + c] = pseudo_i8(idx);
         }
     }
 
