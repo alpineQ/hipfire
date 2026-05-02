@@ -77,18 +77,58 @@ impl XorShift64 {
     }
 }
 
-// f32 -> bf16 (round-to-nearest-even). Mirrors AIE-2P bf16 semantics.
-// Returns the 16-bit pattern as a u16.
+// AIE-2P-shape bf16 conversions, characterized empirically via the
+// asym3_dequant_256_f32 diagnostic kernel (see `--sweep` mode of
+// hipx-diagnose-asym3-mul):
+//
+//   - Kernel's `(bfloat16)(*float_ptr)` cast: round-toward-zero
+//     (drop low 16 mantissa bits, no rounding bias). Different from
+//     IEEE round-to-nearest-even when the dropped bits are non-zero.
+//
+//   - Kernel's `aie::mul(bf16, bf16) -> accfloat`: bit-faithful.
+//     Sweep across 14336 (cnorm bf16 x cb_idx) pairs with bf16-exact
+//     cnorm produced ratio = 1.0 between CPU f32 product and NPU
+//     f32 accumulator. The mul is "promote both to f32, multiply,
+//     keep f32 accumulator."
+//
+//   - Kernel's `accfloat.to_vector<bfloat16>()`: round-away-from-zero
+//     (any non-zero dropped bits bias magnitude up). Empirically
+//     248/256 of the original verifier mismatches were RAZ-aligned.
+//
+// The CPU reference below mirrors all three exactly.
+
+/// f32 -> bf16, RTZ. Drop low 16 bits.
+fn f32_to_bf16_bits_rtz(x: f32) -> u16 {
+    let xb = x.to_bits();
+    if (xb & 0x7fff_ffff) > 0x7f80_0000 {
+        return ((xb >> 16) | 0x0040) as u16;
+    }
+    (xb >> 16) as u16
+}
+
+/// f32 -> bf16, round-away-from-zero. Used for the final down-conversion
+/// after the AIE-2P-shape mul.
+fn f32_to_bf16_bits_raz(x: f32) -> u16 {
+    let xb = x.to_bits();
+    if (xb & 0x7fff_ffff) > 0x7f80_0000 {
+        return ((xb >> 16) | 0x0040) as u16;
+    }
+    let abs = xb & 0x7fff_ffff;
+    let sign = xb & 0x8000_0000;
+    let biased = abs.wrapping_add(0xffff);
+    ((sign | (biased & 0x7fff_ffff)) >> 16) as u16
+}
+
+/// f32 -> bf16, RNE. Kept for diagnostic comparison only.
+#[allow(dead_code)]
 fn f32_to_bf16_bits(x: f32) -> u16 {
     let xb = x.to_bits();
     if (xb & 0x7fff_ffff) > 0x7f80_0000 {
-        // NaN: preserve quiet bit, truncate
         return ((xb >> 16) | 0x0040) as u16;
     }
-    // Round-to-nearest-even
     let lsb = (xb >> 16) & 1;
-    let rounding_bias = 0x7fff + lsb;
-    ((xb.wrapping_add(rounding_bias)) >> 16) as u16
+    let bias = 0x7fff + lsb;
+    ((xb.wrapping_add(bias)) >> 16) as u16
 }
 
 fn bf16_bits_to_f32(b: u16) -> f32 {
@@ -97,12 +137,13 @@ fn bf16_bits_to_f32(b: u16) -> f32 {
 
 /// CPU reference using a CALIBRATED codebook (the kernel's actual
 /// stored bf16 representations, measured by the calibrate phase).
-/// Mul model: bf16-promote-to-f32, multiply, RNE to bf16.
+/// AIE-2P-shape mul model: cnorm f32 -> bf16 RTZ -> f32 promote, cb
+/// bf16 -> f32 promote, f32 multiply, f32 -> bf16 RAZ.
 fn cpu_reference_calibrated(packed: &[u8], cnorm: f32, calibrated_cb: &[u16; 8],
                             out_bf16: &mut [u16]) {
     assert_eq!(packed.len(), PACKED_BYTES);
     assert_eq!(out_bf16.len(), HEAD_DIM);
-    let cnorm_b = bf16_bits_to_f32(f32_to_bf16_bits(cnorm));
+    let cnorm_b = bf16_bits_to_f32(f32_to_bf16_bits_rtz(cnorm));
     let cb_f32: [f32; 8] = std::array::from_fn(|i| bf16_bits_to_f32(calibrated_cb[i]));
     for tid in 0..32 {
         let base = tid * 3;
@@ -112,7 +153,7 @@ fn cpu_reference_calibrated(packed: &[u8], cnorm: f32, calibrated_cb: &[u16; 8],
         for i in 0..8 {
             let idx = ((word >> (i * 3)) & 7) as usize;
             let dim = tid * 8 + i;
-            out_bf16[dim] = f32_to_bf16_bits(cnorm_b * cb_f32[idx]);
+            out_bf16[dim] = f32_to_bf16_bits_raz(cnorm_b * cb_f32[idx]);
         }
     }
 }
@@ -142,19 +183,18 @@ fn cpu_reference(packed: &[u8], cnorm: f32, out_bf16: &mut [u16]) {
     assert_eq!(packed.len(), PACKED_BYTES);
     assert_eq!(out_bf16.len(), HEAD_DIM);
 
-    // Truncate cnorm and codebook to bf16, then promote back to f32
-    // for the multiplication. This matches "bf16 inputs, f32 internal,
-    // bf16 output" semantics.
-    let cnorm_bf16 = f32_to_bf16_bits(cnorm);
+    // AIE-2P-shape mul: cnorm f32 -> bf16 RTZ -> f32 promote, cb bf16
+    // -> f32 promote, f32 multiply, f32 -> bf16 RAZ. See the f32
+    // conversion docs above.
+    let cnorm_bf16 = f32_to_bf16_bits_rtz(cnorm);
     let cnorm_b = bf16_bits_to_f32(cnorm_bf16);
 
-    let cb_b: [f32; 8] = {
-        let mut a = [0f32; 8];
-        for i in 0..8 {
-            a[i] = bf16_bits_to_f32(f32_to_bf16_bits(TURBO_C3_256[i]));
-        }
-        a
-    };
+    // Codebook bf16 reps confirmed byte-identical between kernel and
+    // CPU via calibration; RTZ and RNE happen to agree on TURBO_C3_256.
+    // Use RTZ here for consistency with the cnorm conversion.
+    let cb_b: [f32; 8] = std::array::from_fn(|i|
+        bf16_bits_to_f32(f32_to_bf16_bits_rtz(TURBO_C3_256[i]))
+    );
 
     for tid in 0..32 {
         let base = tid * 3;
@@ -165,7 +205,7 @@ fn cpu_reference(packed: &[u8], cnorm: f32, out_bf16: &mut [u16]) {
             let idx = ((word >> (i * 3)) & 7) as usize;
             let dim = tid * 8 + i;
             let v = cnorm_b * cb_b[idx];
-            out_bf16[dim] = f32_to_bf16_bits(v);
+            out_bf16[dim] = f32_to_bf16_bits_raz(v);
         }
     }
 }
