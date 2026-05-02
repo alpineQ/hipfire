@@ -154,15 +154,16 @@ module {
 
       // Output DMAs. Column 0 writes chunks 0..511 (offset 0,
       // 131072 bf16 elements); column 1 writes chunks 512..1023
-      // (offset 131072 bf16 elements). Only the col 1 task issues
-      // the completion token so the host waits for all data.
+      // (offset 131072 bf16 elements). BOTH issue completion
+      // tokens and BOTH are awaited; awaiting only one lets the
+      // host return before the other column's data lands.
       %t_out_0 = aiex.dma_configure_task_for @bf16_out_0 {
         aie.dma_bd(%out : memref<262144xbf16>, 0, 131072,
                    [<size = 1, stride = 0>, <size = 1, stride = 0>,
                     <size = 512, stride = 256>, <size = 256, stride = 1>])
                   {burst_length = 0 : i32}
         aie.end
-      }
+      } {issue_token = true}
       aiex.dma_start_task(%t_out_0)
 
       %t_out_1 = aiex.dma_configure_task_for @bf16_out_1 {
@@ -173,12 +174,12 @@ module {
         aie.end
       } {issue_token = true}
       aiex.dma_start_task(%t_out_1)
+      aiex.dma_await_task(%t_out_0)
       aiex.dma_await_task(%t_out_1)
       aiex.dma_free_task(%t_packed_0)
       aiex.dma_free_task(%t_cnorm_0)
       aiex.dma_free_task(%t_packed_1)
       aiex.dma_free_task(%t_cnorm_1)
-      aiex.dma_free_task(%t_out_0)
     }
   }
 }
