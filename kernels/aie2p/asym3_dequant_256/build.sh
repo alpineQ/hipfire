@@ -56,11 +56,16 @@ echo "[1/2] clang++ --target=aie2p-none-unknown-elf -std=c++20 -c asym3_dequant_
 # The xclbin is a zip; PDI extracts via a follow-up unzip.
 echo "[2/2] aiecc --aie-generate-xclbin --aie-generate-npu-insts aie.mlir"
 cd build
+# aiecc shells out to Peano's opt/llc to compile the per-tile MLIR
+# down to AIE-2P object code. Point it at the Peano install (same
+# tree we used for the C++ kernel compile in step 1).
+PEANO_INSTALL_DIR="$PEANO" \
 "$AIECC_BIN" \
     --aie-generate-xclbin \
     --aie-generate-npu-insts \
     --no-compile-host \
     --no-xchesscc --no-xbridge \
+    --peano="$PEANO" \
     --xclbin-name=asym3_dequant.xclbin \
     --npu-insts-name=insts.bin \
     "$SRCDIR/aie.mlir"
