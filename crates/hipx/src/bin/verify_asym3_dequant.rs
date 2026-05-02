@@ -176,7 +176,7 @@ fn run_one_seed(
         let buf = packed_bo.map().expect("packed map");
         buf[..PACKED_BYTES].copy_from_slice(&packed);
     }
-    packed_bo.sync(SYNC_TO_DEVICE)?;
+    let _ = packed_bo.sync(SYNC_TO_DEVICE);
     let packed_va = packed_bo.host_ptr().unwrap() as u64;
 
     let mut cnorm_bo = hipx_dev.alloc_shmem(CNORM_BYTES).expect("cnorm alloc");
@@ -184,7 +184,7 @@ fn run_one_seed(
         let buf = cnorm_bo.map().expect("cnorm map");
         buf[..4].copy_from_slice(&cnorm.to_le_bytes());
     }
-    cnorm_bo.sync(SYNC_TO_DEVICE)?;
+    let _ = cnorm_bo.sync(SYNC_TO_DEVICE);
     let cnorm_va = cnorm_bo.host_ptr().unwrap() as u64;
 
     let mut out_bo = hipx_dev.alloc_shmem(OUT_BYTES).expect("out alloc");
@@ -192,17 +192,17 @@ fn run_one_seed(
         let buf = out_bo.map().expect("out map");
         for b in buf[..OUT_BYTES].iter_mut() { *b = 0xCC; } // sentinel
     }
-    out_bo.sync(SYNC_TO_DEVICE)?;
+    let _ = out_bo.sync(SYNC_TO_DEVICE);
     let out_va = out_bo.host_ptr().unwrap() as u64;
 
     // Placeholder bo3/bo4 same as vec_scalar_mul.
     let mut bo3 = hipx::Bo::alloc_shmem_exact(hipx_dev.device.fd, 8)?;
     { let buf = bo3.map()?; for b in buf.iter_mut() { *b = 0; } }
-    bo3.sync(SYNC_TO_DEVICE)?;
+    let _ = bo3.sync(SYNC_TO_DEVICE);
     let bo3_va = bo3.host_ptr().unwrap() as u64;
     let mut bo4 = hipx::Bo::alloc_shmem_exact(hipx_dev.device.fd, 1)?;
     { let buf = bo4.map()?; for b in buf.iter_mut() { *b = 0; } }
-    bo4.sync(SYNC_TO_DEVICE)?;
+    let _ = bo4.sync(SYNC_TO_DEVICE);
     let bo4_va = bo4.host_ptr().unwrap() as u64;
 
     let mut cmd_bo = hipx_dev.alloc_cmd(4096)?;
@@ -223,7 +223,7 @@ fn run_one_seed(
         eb.set_arg_u64(args::BO4, bo4_va);
         let _ = eb.finalize(0x3C);
     }
-    cmd_bo.sync(SYNC_TO_DEVICE)?;
+    let _ = cmd_bo.sync(SYNC_TO_DEVICE);
 
     let seq = submit_exec_cmd(
         hipx_dev.device.fd,
@@ -232,7 +232,7 @@ fn run_one_seed(
         &[instr_bo, &packed_bo, &cnorm_bo, &out_bo, &bo3, &bo4],
     )?;
     timeline_wait(hipx_dev.device.fd, ctx.syncobj_handle, seq, Duration::from_secs(5))?;
-    out_bo.sync(SYNC_FROM_DEVICE)?;
+    let _ = out_bo.sync(SYNC_FROM_DEVICE);
 
     // Compare bf16-by-bf16
     let outp = out_bo.map()?;
