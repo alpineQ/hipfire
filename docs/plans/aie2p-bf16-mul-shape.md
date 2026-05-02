@@ -92,33 +92,43 @@ Stage 1.1 currently uses a third path:
     fictional hardware model:
 
     1. **Determinism**: same input twice -> same output.
-    2. **Max bf16 ULP per element <= 4** across 100 random seeds
-       (with one ULP of headroom over the empirical max of 3).
-       Catches structural bugs (codebook precision, layout,
-       unpack, off-by-one) which produce errors much larger than
-       the few-ULP hardware rounding floor.
-    3. **|mean signed ULP error| <= 1.0** across all diff'd
-       elements (with headroom over the empirical ~0.7 systematic
-       drift). Catches large-magnitude systematic-bias bugs.
+    2. **Max bf16 ULP per element <= 2** across 100+ random seeds
+       (1 ULP of headroom over the empirical max of 2). Catches
+       structural bugs (codebook precision, layout, unpack,
+       off-by-one) which produce errors much larger than the
+       few-ULP hardware rounding floor.
+    3. **|mean signed ULP error| <= 0.5** across all diff'd
+       elements (~10x headroom over the empirical ~0.05). Catches
+       large-magnitude systematic-bias bugs.
 
-    Empirical envelope on 100 random seeds, hipx (Strix Halo
-    NPU2), commit 573cdde:
+    Empirical envelope post-codex codebook RNE fix (commit 5adfd07):
 
     ```
-    determinism:    100 / 100 PASS
-    max ULP:        3 (== 0.5 % of seeds; most are 0 or 1 ULP)
-    mean signed:    +0.70 ULP (NPU consistently slightly larger
-                    magnitude than CPU model with RTZ cnorm)
-    per-seed:       86 PASS at 2-ULP bound; 100 PASS at 4-ULP
+    100 random seeds, verify_asym3_dequant.rs:
+      determinism:    PASS
+      max ULP:        2
+      mean signed:    -0.06 (codebook RNE matches kernel)
+
+    1000 random seeds, verify_asym3_dequant_layer.rs (N_ITERS=1024):
+      determinism:    PASS across all 1000 seeds
+      max ULP:        2
+      mean signed:    +0.0088
+
+    1024 dispatches, hipfire_x_asym3_shadow.rs (16 layers x 8 heads
+    x 8 positions, realistic varied cnorm):
+      determinism:    PASS
+      max ULP:        2
+      mean signed:    -0.02 (per-layer max bias +0.24)
     ```
 
-    The +0.7 mean signed bias is consistent with the kernel's
-    `(bfloat16)(*float_ptr)` cnorm cast biasing magnitude upward
-    relative to my CPU's RTZ-down conversion plus the bf16
-    down-conversion's known non-uniformity (-2 / +1 / 0 ULP cases
-    documented above). Both effects compose to produce a
-    small-positive mean drift. This is the AIE-2P bf16 mul-and-
-    store hardware shape, not a bug.
+    The codex review caught that the kernel codebook is `bfloat16(
+    f32_lit)` RNE-rounded, not RTZ-truncated. Earlier CPU models
+    used RTZ for codebook conversion which produced +0.70 mean
+    bias by mismatching idx in {1, 3, 4, 6} where dropped bits
+    >= 0x8000. After fixing the CPU model to use RNE for codebook
+    (kernel matches RNE), the mean drift collapsed to under 0.1.
+    The bounded ULP residual reflects the AIE-2P bf16 mul-and-
+    store hardware shape (-2 / +1 / 0 ULP cases documented above).
 
     Strict bit-for-bit mode is preserved as `ASYM3_STRICT=1` for
     future use when a LUT lands.
