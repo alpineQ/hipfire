@@ -453,6 +453,66 @@ pub fn drm_ioctl_syncobj_timeline_wait() -> libc::c_ulong {
     drm_iowr_generic::<DrmSyncobjTimelineWait>(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_NR)
 }
 
+// ─── amdgpu DRM ioctls ─────────────────────────────────────────────────
+//
+// Minimal subset — just enough to allocate a GTT BO and MMAP it for
+// CPU access, so we can prove the iGPU↔NPU dmabuf round-trip on
+// Strix Halo (UMA). Full GPU compute happens through HIP/HSA via
+// `rdna-compute`; these are only used for direct GEM allocation when
+// we want a stable kernel-managed dmabuf fd.
+
+const DRM_AMDGPU_GEM_CREATE_NR: u8 = 0x00;
+const DRM_AMDGPU_GEM_MMAP_NR: u8 = 0x01;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DrmAmdgpuGemCreateIn {
+    pub bo_size: u64,
+    pub alignment: u64,
+    pub domains: u64,
+    pub domain_flags: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DrmAmdgpuGemCreateOut {
+    pub handle: u32,
+    pub _pad: u32,
+}
+
+#[repr(C)]
+pub union DrmAmdgpuGemCreate {
+    pub in_: DrmAmdgpuGemCreateIn,
+    pub out: DrmAmdgpuGemCreateOut,
+}
+
+pub fn drm_ioctl_amdgpu_gem_create() -> libc::c_ulong {
+    drm_iowr::<DrmAmdgpuGemCreate>(DRM_AMDGPU_GEM_CREATE_NR)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DrmAmdgpuGemMmapIn {
+    pub handle: u32,
+    pub _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DrmAmdgpuGemMmapOut {
+    pub addr_ptr: u64,
+}
+
+#[repr(C)]
+pub union DrmAmdgpuGemMmap {
+    pub in_: DrmAmdgpuGemMmapIn,
+    pub out: DrmAmdgpuGemMmapOut,
+}
+
+pub fn drm_ioctl_amdgpu_gem_mmap() -> libc::c_ulong {
+    drm_iowr::<DrmAmdgpuGemMmap>(DRM_AMDGPU_GEM_MMAP_NR)
+}
+
 // ─── DRM PRIME (dmabuf import/export) ──────────────────────────────────
 //
 // Generic across DRM drivers. Used to share BOs between amdgpu (iGPU)
