@@ -636,6 +636,13 @@ pub const TRIATTN_SCORE_ASYM4_SRC: &str = include_str!("../../../kernels/src/tri
 /// TriAttention scoring on asym2 (Givens-rotated 2-bit) K cache.
 pub const TRIATTN_SCORE_ASYM2_SRC: &str = include_str!("../../../kernels/src/triattn_score_asym2.hip");
 
+/// TriAttention scoring on a pre-dequanted bf16 K cache (NPU dequant
+/// path companion). Same Givens + RoPE + score logic as
+/// triattn_score_asym3.hip; the dequant block is replaced with a
+/// direct bf16 read since the values arrive pre-dequanted from
+/// NpuRuntime::asym3_dequant_layer.
+pub const TRIATTN_SCORE_BF16_SRC: &str = include_str!("../../../kernels/src/triattn_score_bf16.hip");
+
 /// Gather-based compaction for KV eviction: copy `budget` src rows to dst.
 pub const KV_COMPACT_GATHER_SRC: &str = include_str!("../../../kernels/src/kv_compact_gather.hip");
 
