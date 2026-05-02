@@ -291,11 +291,12 @@ pub mod asym3_dequant_256_args {
     pub const OUT: usize = BO2;     // 512 B  (256 bf16 dequanted K elements)
 }
 
-/// asym3_dequant_layer — per-layer batched asym3 dequant. Stage 1.4
-/// MVP variant. Single dispatch covers `N_ITERS` (head, position)
-/// pairs sharing the kernel binary; compute is identical to
-/// `asym3_dequant_256` per iteration. Hardcoded N_ITERS=32 for the
-/// MVP iteration; scale up + multi-core fan-out follows.
+/// asym3_dequant_layer - per-layer batched asym3 dequant.
+/// Single dispatch covers `N_ITERS` (head, position) pairs sharing
+/// the kernel binary; compute is identical to `asym3_dequant_256`
+/// per iteration. Stage 1.4 scaling iteration: N_ITERS=1024.
+/// Production target (full 27B Gemma layer = 32768 iters with
+/// multi-core fan-out) follows in the next scaling pass.
 ///
 /// Layout per dispatch:
 ///   packed: N_ITERS * 96 bytes  (indices, contiguous per iter)
@@ -315,7 +316,7 @@ pub const ASYM3_DEQUANT_LAYER_KERNEL_ID: u32 = 0x901;
 pub const ASYM3_DEQUANT_LAYER_OPS_PER_CYCLE: u32 = 2048;
 pub const ASYM3_DEQUANT_LAYER_COLUMNS: u32 = 8;
 pub const ASYM3_DEQUANT_LAYER_HEAD_DIM: usize = 256;
-pub const ASYM3_DEQUANT_LAYER_N_ITERS: usize = 32;
+pub const ASYM3_DEQUANT_LAYER_N_ITERS: usize = 1024;
 pub const ASYM3_DEQUANT_LAYER_PACKED_BYTES: usize =
     ASYM3_DEQUANT_LAYER_N_ITERS * 96;
 pub const ASYM3_DEQUANT_LAYER_CNORM_BYTES: usize =
