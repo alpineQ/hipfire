@@ -62,6 +62,9 @@ pub struct NpuRuntime {
     /// dispatch). Behind `HIPFIRE_NPU_DEQUANT=1` until stage 1.5
     /// shows a measured tok/s lift; default off.
     asym3_dequant_256: Option<Asym3Dequant256Kernel>,
+    /// asym3 K-cache dequant layer-batched kernel (N_ITERS chunks of
+    /// 256-dim per dispatch). Production-shape stage 1.4 kernel.
+    asym3_dequant_layer: Option<Asym3DequantLayerKernel>,
 }
 
 /// Persistent state for the i16 288×288 matvec kernel. All BOs,
@@ -165,6 +168,24 @@ struct Asym3Dequant256Kernel {
     cmd_bo: hipx::Bo,
 }
 
+/// Persistent state for the layer-batched asym3 K-cache dequant
+/// kernel (N_ITERS chunks per dispatch; chunk = one (head, position)
+/// pair). Stage 1.4 production-shape variant.
+struct Asym3DequantLayerKernel {
+    ctx: hipx::hwctx::Hwctx,
+    _cu: hipx::cmd::CuBinding,
+    instr_bo: hipx::Bo,
+    /// N_ITERS * 96 B  (packed indices; 32 threads x 3 bytes per iter)
+    packed_bo: hipx::Bo,
+    /// N_ITERS * 4 B   (one f32 cnorm per iter)
+    cnorm_bo: hipx::Bo,
+    /// N_ITERS * 512 B (256 bf16 outputs per iter)
+    out_bo: hipx::Bo,
+    bo3_bo: hipx::Bo,
+    bo4_bo: hipx::Bo,
+    cmd_bo: hipx::Bo,
+}
+
 #[derive(Default, Debug, Clone, Copy)]
 pub struct AvailableOps {
     /// 4 KiB byte passthrough (proved end-to-end via hipx-passthrough).
@@ -222,6 +243,7 @@ impl NpuRuntime {
             matmul_bf16_512: None,
             matmul_bf16_1024: None,
             asym3_dequant_256: None,
+            asym3_dequant_layer: None,
         })
     }
 
@@ -2145,6 +2167,163 @@ impl NpuRuntime {
         let _ = kern.out_bo.sync(SYNC_FROM_DEVICE);
         let outp = kern.out_bo.map()?;
         out.copy_from_slice(&outp[..ASYM3_DEQUANT_256_OUT_BYTES]);
+        Ok(())
+    }
+
+    /// Layer-batched asym3 K-cache dequant. Single dispatch covers
+    /// `ASYM3_DEQUANT_LAYER_N_ITERS` (head, position) chunks. Caller
+    /// must size buffers exactly to the embedded constants:
+    /// - `packed`: `ASYM3_DEQUANT_LAYER_PACKED_BYTES` bytes
+    /// - `cnorms`: `ASYM3_DEQUANT_LAYER_N_ITERS` f32 entries
+    /// - `out`:    `ASYM3_DEQUANT_LAYER_OUT_BYTES` bytes (bf16 LE pairs)
+    ///
+    /// Same lazy-init pattern as `asym3_dequant_256`; first call sets
+    /// up hwctx + bound CU + reused BOs; subsequent calls reuse the
+    /// state and just refresh the per-call data via map+sync.
+    pub fn asym3_dequant_layer(
+        &mut self,
+        packed: &[u8],
+        cnorms: &[f32],
+        out: &mut [u8],
+    ) -> Result<(), hipx::XdnaError> {
+        use hipx::cmd::{config_cus, submit_exec_cmd};
+        use hipx::ert::{reset_state, ErtBuilder};
+        use hipx::fence::timeline_wait;
+        use hipx::hwctx::HwctxBuilder;
+        use hipx::ioctl::{SYNC_FROM_DEVICE, SYNC_TO_DEVICE};
+        use hipx::kernels::{
+            asym3_dequant_layer_args as args, ASYM3_DEQUANT_LAYER_CNORM_BYTES,
+            ASYM3_DEQUANT_LAYER_COLUMNS, ASYM3_DEQUANT_LAYER_INSTS,
+            ASYM3_DEQUANT_LAYER_N_ITERS, ASYM3_DEQUANT_LAYER_OPS_PER_CYCLE,
+            ASYM3_DEQUANT_LAYER_OUT_BYTES, ASYM3_DEQUANT_LAYER_PACKED_BYTES,
+            ASYM3_DEQUANT_LAYER_PDI,
+        };
+        use std::time::Duration;
+
+        assert_eq!(packed.len(), ASYM3_DEQUANT_LAYER_PACKED_BYTES,
+            "packed slice must be {} bytes", ASYM3_DEQUANT_LAYER_PACKED_BYTES);
+        assert_eq!(cnorms.len(), ASYM3_DEQUANT_LAYER_N_ITERS,
+            "cnorms slice must be {} entries", ASYM3_DEQUANT_LAYER_N_ITERS);
+        assert_eq!(out.len(), ASYM3_DEQUANT_LAYER_OUT_BYTES,
+            "out slice must be {} bytes", ASYM3_DEQUANT_LAYER_OUT_BYTES);
+
+        if self.asym3_dequant_layer.is_none() {
+            let mut hb = HwctxBuilder::default();
+            hb.num_columns = ASYM3_DEQUANT_LAYER_COLUMNS;
+            hb.max_opc = ASYM3_DEQUANT_LAYER_OPS_PER_CYCLE;
+            let ctx = self.hipx.create_hwctx(&hb)?;
+
+            let pdi_bo = self.hipx.alloc_dev(ASYM3_DEQUANT_LAYER_PDI.len())?;
+            unsafe {
+                let buf = self.hipx.dev_slice(&pdi_bo)?;
+                buf[..ASYM3_DEQUANT_LAYER_PDI.len()].copy_from_slice(ASYM3_DEQUANT_LAYER_PDI);
+            }
+            let _ = pdi_bo.sync(SYNC_TO_DEVICE);
+            let cu = config_cus(self.hipx.device.fd, &ctx, vec![pdi_bo], &[0u8])?;
+
+            let instr_bo = self.hipx.alloc_dev(ASYM3_DEQUANT_LAYER_INSTS.len())?;
+            unsafe {
+                let buf = self.hipx.dev_slice(&instr_bo)?;
+                buf[..ASYM3_DEQUANT_LAYER_INSTS.len()].copy_from_slice(ASYM3_DEQUANT_LAYER_INSTS);
+            }
+            let _ = instr_bo.sync(SYNC_TO_DEVICE);
+            let ninstr_dwords = (ASYM3_DEQUANT_LAYER_INSTS.len() / 4) as u32;
+
+            let mut packed_bo = self.hipx.alloc_shmem(ASYM3_DEQUANT_LAYER_PACKED_BYTES)?;
+            let mut cnorm_bo = self.hipx.alloc_shmem(ASYM3_DEQUANT_LAYER_CNORM_BYTES)?;
+            let mut out_bo = self.hipx.alloc_shmem(ASYM3_DEQUANT_LAYER_OUT_BYTES)?;
+            let mut bo3_bo = hipx::Bo::alloc_shmem_exact(self.hipx.device.fd, 8)?;
+            let mut bo4_bo = hipx::Bo::alloc_shmem_exact(self.hipx.device.fd, 1)?;
+            let _ = packed_bo.map()?;
+            let _ = cnorm_bo.map()?;
+            let _ = out_bo.map()?;
+            let _ = bo3_bo.map()?;
+            let _ = bo4_bo.map()?;
+
+            let packed_va = packed_bo.host_ptr().unwrap() as u64;
+            let cnorm_va = cnorm_bo.host_ptr().unwrap() as u64;
+            let out_va = out_bo.host_ptr().unwrap() as u64;
+            let bo3_va = bo3_bo.host_ptr().unwrap() as u64;
+            let bo4_va = bo4_bo.host_ptr().unwrap() as u64;
+
+            let mut cmd_bo = self.hipx.alloc_cmd(4096)?;
+            {
+                let cbuf = cmd_bo.map()?;
+                let mut eb = ErtBuilder::new_start_cu(&mut cbuf[..256]);
+                eb.set_cu_mask(0x1);
+                eb.set_arg_u64(args::OPCODE, 3);
+                eb.set_arg_u64(args::INSTR_PTR, instr_bo.xdna_addr);
+                eb.set_arg_u32(args::NINSTR, ninstr_dwords);
+                eb.set_arg_u64(args::PACKED, packed_va);
+                eb.set_arg_u64(args::CNORM, cnorm_va);
+                eb.set_arg_u64(args::OUT, out_va);
+                eb.set_arg_u64(args::BO3, bo3_va);
+                eb.set_arg_u64(args::BO4, bo4_va);
+                let _ = eb.finalize(0x3C);
+            }
+            let _ = cmd_bo.sync(SYNC_TO_DEVICE);
+
+            self.asym3_dequant_layer = Some(Asym3DequantLayerKernel {
+                ctx,
+                _cu: cu,
+                instr_bo,
+                packed_bo,
+                cnorm_bo,
+                out_bo,
+                bo3_bo,
+                bo4_bo,
+                cmd_bo,
+            });
+            self.available_ops.kv_dequant = true;
+        }
+
+        let kern = self.asym3_dequant_layer.as_mut().unwrap();
+        {
+            let pbuf = kern.packed_bo.map()?;
+            pbuf[..ASYM3_DEQUANT_LAYER_PACKED_BYTES].copy_from_slice(packed);
+        }
+        let _ = kern.packed_bo.sync(SYNC_TO_DEVICE);
+        {
+            let cbuf = kern.cnorm_bo.map()?;
+            for (i, &c) in cnorms.iter().enumerate() {
+                cbuf[i * 4..i * 4 + 4].copy_from_slice(&c.to_le_bytes());
+            }
+        }
+        let _ = kern.cnorm_bo.sync(SYNC_TO_DEVICE);
+        {
+            let obuf = kern.out_bo.map()?;
+            for byte in obuf[..ASYM3_DEQUANT_LAYER_OUT_BYTES].iter_mut() { *byte = 0xCC; }
+        }
+        let _ = kern.out_bo.sync(SYNC_TO_DEVICE);
+        {
+            let cbuf = kern.cmd_bo.map()?;
+            reset_state(&mut cbuf[..4]);
+        }
+        let _ = kern.cmd_bo.sync(SYNC_TO_DEVICE);
+
+        let seq = submit_exec_cmd(
+            self.hipx.device.fd,
+            &kern.ctx,
+            &[&kern.cmd_bo],
+            &[
+                &kern.instr_bo,
+                &kern.packed_bo,
+                &kern.cnorm_bo,
+                &kern.out_bo,
+                &kern.bo3_bo,
+                &kern.bo4_bo,
+            ],
+        )?;
+        timeline_wait(
+            self.hipx.device.fd,
+            kern.ctx.syncobj_handle,
+            seq,
+            Duration::from_secs(10),
+        )?;
+
+        let _ = kern.out_bo.sync(SYNC_FROM_DEVICE);
+        let outp = kern.out_bo.map()?;
+        out.copy_from_slice(&outp[..ASYM3_DEQUANT_LAYER_OUT_BYTES]);
         Ok(())
     }
 }
