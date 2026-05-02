@@ -9695,6 +9695,70 @@ impl Gpu {
         }
     }
 
+    /// TriAttention scoring on a pre-dequanted bf16 K cache. Same shape
+    /// as `triattn_score_asym3` but reads bf16 K directly instead of
+    /// applying the asym3 dequant inline. The bf16 K is the output of
+    /// `NpuRuntime::asym3_dequant_layer`; layout is contiguous
+    /// [seq_len, n_kv_heads, head_dim] bf16.
+    pub fn triattn_score_bf16(
+        &mut self,
+        k_cache_bf16: &GpuTensor,
+        centers: &GpuTensor,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        scores: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        n_rot: usize,
+        rope_theta: f32,
+        p_q: f32,
+        seq_len: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "triattn_score_bf16",
+            kernels::TRIATTN_SCORE_BF16_SRC,
+            "triattn_score_bf16",
+        )?;
+        let func = &self.functions["triattn_score_bf16"];
+        let mut k_ptr = k_cache_bf16.buf.as_ptr();
+        let mut c_ptr = centers.buf.as_ptr();
+        let mut ct_ptr = cos_theta.buf.as_ptr();
+        let mut st_ptr = sin_theta.buf.as_ptr();
+        let mut s_ptr = scores.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut nr = n_rot as i32;
+        let mut th = rope_theta;
+        let mut pq = p_q;
+        let mut sl = seq_len as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut c_ptr as *mut _ as *mut c_void,
+            &mut ct_ptr as *mut _ as *mut c_void,
+            &mut st_ptr as *mut _ as *mut c_void,
+            &mut s_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut th as *mut _ as *mut c_void,
+            &mut pq as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [seq_len as u32, n_heads as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Compact a KV cache row by row: writes `dst[new_pos] = src[retain[new_pos]]`
     /// for `new_pos` in `[0, budget)`. Works for any byte-addressable cache
     /// layout — pass the layout's bytes-per-position.
