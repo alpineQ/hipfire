@@ -1,5 +1,40 @@
 # Manual Review Queue (npu-roadmap/2026-05-02)
 
+## OPEN-2: Tighten verifier bounds from (4, 1.0) to (2, 0.5)
+
+**Stage**: 1.1 (post codex review fixes, commit 5adfd07)
+
+**Status**: After fixing the codebook RTZ-vs-RNE bias the codex
+review caught (P2 #3), the empirical envelope dropped from
+(max=3, mean=+0.70) to (max=2, mean=-0.06). The 1 ULP and 0.5 ULP
+of headroom in the current bounds (4, 1.0) is now far more
+permissive than necessary. Real bug classes still produce >>2 ULP
+errors, but the gap to "actually catch new sources of drift" is
+wider than ideal.
+
+**Recommendation**: tighten to (max_ulp=2, mean_bias=0.5). This is
+1 ULP of headroom over the empirical max and ~10x of headroom
+over the empirical mean, which still passes today but flags any
+future regression that pushes max_ulp to 3 or mean past 0.5
+(both of which would suggest a new bias source worth
+investigating).
+
+**Why deferred**: scoping pivot - stage 1.4 (production layer
+kernel) is the next priority, and tightening bounds is a
+zero-risk infrastructure improvement that can land alongside or
+after 1.4 once we know the layer-batched kernel has the same
+ULP envelope.
+
+**Action**: 1-line change in
+`crates/hipx/src/bin/verify_asym3_dequant.rs::main` (the
+`max_ulp_bound` and `mean_bias_bound` initializers), plus
+matching update in
+`crates/engine/examples/hipfire_x_asym3_shadow.rs` env defaults,
+plus matching update in
+`docs/plans/aie2p-bf16-mul-shape.md` envelope description.
+
+
+
 ## ESCALATED-1: AIE-2P bf16 mul rounding semantics
 
 **Stage**: 1.1 (correctness verifier)
