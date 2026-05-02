@@ -236,11 +236,84 @@ fn open_with(
 }
 
 fn main() -> ExitCode {
-    if let Err(e) = run() {
+    let result = if std::env::args().any(|a| a == "--sweep") {
+        run_sweep()
+    } else {
+        run()
+    };
+    if let Err(e) = result {
         eprintln!("FAIL: {e}");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+/// Sweep cnorm bf16 values across a wide range, dispatch the f32
+/// kernel for each (cnorm, idx_k) pair, write tab-separated tuples
+/// to bench/asym3_mul_sweep.tsv. Used to characterize AIE-2P bf16
+/// mul semantics empirically.
+fn run_sweep() -> Result<(), Box<dyn std::error::Error>> {
+    let f32_pdi = "kernels/aie2p/asym3_dequant_256_f32/build/main.pdi";
+    let f32_insts = "kernels/aie2p/asym3_dequant_256_f32/build/insts.bin";
+    let (h, ctx, instr, ilen, _cu) = open_with(f32_pdi, f32_insts)?;
+
+    // Sample cnorm bf16 values: vary mantissa across a few exponents
+    // covering the realistic range of asym3 K-cache magnitude factors
+    // (around [0.05, 4.0]).
+    let mut cnorms: Vec<f32> = Vec::new();
+    for exp in [-5i32, -4, -3, -2, -1, 0, 1] {  // 2^-5 .. 2^1 -> 0.03125 .. 2.0
+        for m in 0u32..128 {
+            // Construct bf16 value sign 0, exp = 127+exp, mant = m
+            let bf16_bits: u16 = (((127 + exp) as u32) << 7 | m) as u16;
+            let f = bf16_bits_to_f32(bf16_bits);
+            cnorms.push(f);
+            // Also include the negative version
+            cnorms.push(-f);
+        }
+    }
+    cnorms.dedup();
+
+    eprintln!("[sweep] {} cnorm values * 8 codebook = {} dispatches",
+              cnorms.len(), cnorms.len() * 8);
+
+    std::fs::create_dir_all("bench")?;
+    let mut output = String::new();
+    output.push_str("cnorm_f32\tcnorm_bf16\tidx\tcb_bf16\tcpu_f32_prod\tnpu_f32_acc\tratio\n");
+
+    for &cnorm_f in &cnorms {
+        // Encode all 8 codebook entries in dim 0..7 of one packed buffer.
+        // 8 indices in pattern 0,1,2,3,4,5,6,7 fit in 24 bits.
+        let pattern: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+        let mut word: u32 = 0;
+        for i in 0..8 { word |= (pattern[i] as u32) << (i * 3); }
+        let mut packed = vec![0u8; PACKED_BYTES];
+        for tid in 0..32 {
+            let base = tid * 3;
+            packed[base] = (word & 0xff) as u8;
+            packed[base + 1] = ((word >> 8) & 0xff) as u8;
+            packed[base + 2] = ((word >> 16) & 0xff) as u8;
+        }
+
+        let f32_out = dispatch_f32(&h, &ctx, &instr, ilen, &packed, cnorm_f)?;
+
+        let cnorm_bf16 = f32_to_bf16_bits_rne(cnorm_f);
+        let cnorm_b = bf16_bits_to_f32(cnorm_bf16);
+        for k in 0..8usize {
+            let cb_f32 = TURBO_C3_256[k];
+            let cb_bf16 = f32_to_bf16_bits_rne(cb_f32);
+            let cb_b = bf16_bits_to_f32(cb_bf16);
+            let cpu_prod = cnorm_b * cb_b;
+            let npu = f32_out[k];
+            let ratio = if cpu_prod != 0.0 { npu / cpu_prod } else { 0.0 };
+            output.push_str(&format!(
+                "{:.10e}\t0x{:04x}\t{}\t0x{:04x}\t{:.10e}\t{:.10e}\t{:.10}\n",
+                cnorm_f, cnorm_bf16, k, cb_bf16, cpu_prod, npu, ratio
+            ));
+        }
+    }
+    std::fs::write("bench/asym3_mul_sweep.tsv", &output)?;
+    eprintln!("[sweep] wrote bench/asym3_mul_sweep.tsv ({} bytes)", output.len());
+    Ok(())
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
