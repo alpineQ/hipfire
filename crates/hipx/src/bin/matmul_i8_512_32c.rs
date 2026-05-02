@@ -73,16 +73,28 @@ fn main() -> ExitCode {
     let _ = instr_bo.sync(SYNC_TO_DEVICE);
     let ninstr_dwords = (MATMUL_I8_512_32C_INSTS.len() / 4) as u32;
 
+    // Position-encoded inputs with asymmetric prime mixing on (r, kk) and
+    // (kk, c) so the resulting c[r, c] is unique per output position. The
+    // prior (r+kk)&3 / (kk+c)&3 pattern was shift-invariant -- c[r, c] only
+    // depended on (c - r) mod period -- so a tile-remap bug that swapped
+    // diagonal-equal outputs would still pass. With distinct mixing
+    // constants on r vs kk vs c, the shift symmetry is broken and any
+    // (m, n) tile permutation is detectable.
+    //
+    // Range stays in [-2, 2] so accumulator |sum| <= 2 * 2 * 512 = 2048,
+    // far inside i32.
     let mut a_host = vec![0i8; MATMUL_I8_512_32C_M * MATMUL_I8_512_32C_K];
     for r in 0..MATMUL_I8_512_32C_M {
         for kk in 0..MATMUL_I8_512_32C_K {
-            a_host[r * MATMUL_I8_512_32C_K + kk] = ((r + kk) as i8) & 0x3;
+            let v = ((r.wrapping_mul(17).wrapping_add(kk.wrapping_mul(5))) & 0x7) as i32 - 4;
+            a_host[r * MATMUL_I8_512_32C_K + kk] = v as i8;
         }
     }
     let mut b_host = vec![0i8; MATMUL_I8_512_32C_K * MATMUL_I8_512_32C_N];
     for kk in 0..MATMUL_I8_512_32C_K {
         for c in 0..MATMUL_I8_512_32C_N {
-            b_host[kk * MATMUL_I8_512_32C_N + c] = ((kk + c) as i8) & 0x3;
+            let v = ((kk.wrapping_mul(11).wrapping_add(c.wrapping_mul(3))) & 0x7) as i32 - 4;
+            b_host[kk * MATMUL_I8_512_32C_N + c] = v as i8;
         }
     }
 
