@@ -2200,12 +2200,33 @@ impl NpuRuntime {
         };
         use std::time::Duration;
 
-        assert_eq!(packed.len(), ASYM3_DEQUANT_LAYER_PACKED_BYTES,
-            "packed slice must be {} bytes", ASYM3_DEQUANT_LAYER_PACKED_BYTES);
-        assert_eq!(cnorms.len(), ASYM3_DEQUANT_LAYER_N_ITERS,
-            "cnorms slice must be {} entries", ASYM3_DEQUANT_LAYER_N_ITERS);
-        assert_eq!(out.len(), ASYM3_DEQUANT_LAYER_OUT_BYTES,
-            "out slice must be {} bytes", ASYM3_DEQUANT_LAYER_OUT_BYTES);
+        if packed.len() != ASYM3_DEQUANT_LAYER_PACKED_BYTES {
+            return Err(hipx::XdnaError {
+                code: -22,
+                message: format!(
+                    "asym3_dequant_layer: packed.len() = {} but kernel expects {}",
+                    packed.len(), ASYM3_DEQUANT_LAYER_PACKED_BYTES,
+                ),
+            });
+        }
+        if cnorms.len() != ASYM3_DEQUANT_LAYER_N_ITERS {
+            return Err(hipx::XdnaError {
+                code: -22,
+                message: format!(
+                    "asym3_dequant_layer: cnorms.len() = {} but kernel expects {}",
+                    cnorms.len(), ASYM3_DEQUANT_LAYER_N_ITERS,
+                ),
+            });
+        }
+        if out.len() != ASYM3_DEQUANT_LAYER_OUT_BYTES {
+            return Err(hipx::XdnaError {
+                code: -22,
+                message: format!(
+                    "asym3_dequant_layer: out.len() = {} but kernel expects {}",
+                    out.len(), ASYM3_DEQUANT_LAYER_OUT_BYTES,
+                ),
+            });
+        }
 
         if self.asym3_dequant_layer.is_none() {
             let mut hb = HwctxBuilder::default();
