@@ -239,6 +239,9 @@ fn main() -> ExitCode {
     let mut max_rel: f64 = 0.0;
     let mut max_abs: f64 = 0.0;
     let mut first_fail: Option<String> = None;
+    let mut bad_npu_count: usize = 0;       // NaN, +/-inf, or 0xCCCCCCCC sentinel
+    let mut nondet_count: usize = 0;        // run1 != run2 within a seed
+    const SENTINEL_F32_BITS: u32 = 0xCCCCCCCC;
 
     for seed in 1..=n_seeds as u64 {
         let mut rng = XorShift64::new(seed.wrapping_mul(0x9E3779B97F4A7C15));
@@ -328,21 +331,68 @@ fn main() -> ExitCode {
         }
         let _ = score_bo.sync(SYNC_TO_DEVICE);
 
-        let seq = match submit_exec_cmd(
-            hipx_dev.device.fd, &ctx, &[&cmd_bo],
-            &[&instr_bo, &input_bo, &score_bo, &bo3, &bo4],
-        ) {
-            Ok(s) => s,
-            Err(e) => { eprintln!("submit FAIL seed {seed}: {e}"); return ExitCode::FAILURE; }
-        };
-        if let Err(e) = timeline_wait(hipx_dev.device.fd, ctx.syncobj_handle, seq, Duration::from_secs(5)) {
-            eprintln!("timeline_wait FAIL seed {seed}: {e}"); return ExitCode::FAILURE;
+        // Two-dispatch determinism check: same input must produce
+        // the same output across runs.
+        let mut npu_runs = [0.0f32; 2];
+        let mut npu_bits = [0u32; 2];
+        for run_idx in 0..2 {
+            {
+                let cbuf = cmd_bo.map().expect("cmd map");
+                hipx::ert::reset_state(&mut cbuf[..4]);
+            }
+            let _ = cmd_bo.sync(SYNC_TO_DEVICE);
+            // Reset score sentinel each run.
+            {
+                let buf = score_bo.map().expect("score map");
+                buf[0] = 0xCC; buf[1] = 0xCC; buf[2] = 0xCC; buf[3] = 0xCC;
+            }
+            let _ = score_bo.sync(SYNC_TO_DEVICE);
+
+            let seq = match submit_exec_cmd(
+                hipx_dev.device.fd, &ctx, &[&cmd_bo],
+                &[&instr_bo, &input_bo, &score_bo, &bo3, &bo4],
+            ) {
+                Ok(s) => s,
+                Err(e) => { eprintln!("submit FAIL seed {seed}: {e}"); return ExitCode::FAILURE; }
+            };
+            if let Err(e) = timeline_wait(hipx_dev.device.fd, ctx.syncobj_handle, seq, Duration::from_secs(5)) {
+                eprintln!("timeline_wait FAIL seed {seed}: {e}"); return ExitCode::FAILURE;
+            }
+            let _ = score_bo.sync(SYNC_FROM_DEVICE);
+            let outp = score_bo.map().expect("score map back");
+            let mut score_bytes = [0u8; 4];
+            score_bytes.copy_from_slice(&outp[..4]);
+            npu_bits[run_idx] = u32::from_le_bytes(score_bytes);
+            npu_runs[run_idx] = f32::from_le_bytes(score_bytes);
         }
-        let _ = score_bo.sync(SYNC_FROM_DEVICE);
-        let outp = score_bo.map().expect("score map back");
-        let mut score_bytes = [0u8; 4];
-        score_bytes.copy_from_slice(&outp[..4]);
-        let npu = f32::from_le_bytes(score_bytes);
+        let npu = npu_runs[0];
+        if npu_bits[0] != npu_bits[1] {
+            nondet_count += 1;
+            if first_fail.is_none() {
+                first_fail = Some(format!(
+                    "seed {seed} non-deterministic: run1=0x{:08x} run2=0x{:08x}",
+                    npu_bits[0], npu_bits[1]
+                ));
+            }
+        }
+
+        // Sanity: NPU output must be finite and not the pre-dispatch
+        // sentinel. Rust's NaN/inf comparisons silently return false
+        // so without this explicit gate, NaN/inf would pass the
+        // tolerance check below.
+        let bad = !npu.is_finite()
+            || npu_bits[0] == SENTINEL_F32_BITS
+            || npu_bits[1] == SENTINEL_F32_BITS;
+        if bad {
+            bad_npu_count += 1;
+            if first_fail.is_none() {
+                first_fail = Some(format!(
+                    "seed {seed} bad output: bits=0x{:08x} f32={:?}",
+                    npu_bits[0], npu
+                ));
+            }
+            continue;
+        }
 
         let abs = (cpu - npu).abs() as f64;
         let denom = cpu.abs().max(npu.abs()).max(1e-6) as f64;
@@ -356,6 +406,9 @@ fn main() -> ExitCode {
 
     println!();
     println!("=== verify_asym3_score_one ({n_seeds} seeds) ===");
+    println!("  determinism:  {} ({} non-deterministic seeds)",
+             if nondet_count == 0 { "PASS" } else { "FAIL" }, nondet_count);
+    println!("  bad outputs:  {} (NaN, inf, or 0xCCCCCCCC sentinel)", bad_npu_count);
     println!("  max |Δ|  = {max_abs:.4e}");
     println!("  max rel  = {max_rel:.4e}");
     if let Some(fail) = &first_fail { eprintln!("  first failure: {fail}"); }
@@ -363,7 +416,10 @@ fn main() -> ExitCode {
     // Tolerance: 1% relative is a lot but the score is a sum-product
     // of 128 bands so accumulated NR sqrt + reordering noise can hit
     // this. Tighter bound after the SIMD-optimized kernel lands.
-    if max_rel > 1e-2 {
+    let pass = nondet_count == 0
+        && bad_npu_count == 0
+        && max_rel <= 1e-2;
+    if !pass {
         eprintln!("\n=== STAGE 2.6 SCORE VERIFY: FAIL ===");
         ExitCode::FAILURE
     } else {
