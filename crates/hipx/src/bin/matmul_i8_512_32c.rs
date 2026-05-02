@@ -185,19 +185,35 @@ fn main() -> ExitCode {
     let _ = c_bo.sync(SYNC_FROM_DEVICE);
 
     let outp = c_bo.map().expect("C re-map");
-    let mut errors = 0usize;
-    let mut first_bad = None;
-    let n_check = 8;
-    for r in 0..n_check {
-        for c in 0..n_check {
-            let mut want: i32 = 0;
-            for kk in 0..MATMUL_I8_512_32C_K {
-                want += a_host[r * MATMUL_I8_512_32C_K + kk] as i32
-                    * b_host[kk * MATMUL_I8_512_32C_N + c] as i32;
+
+    // Compute the full reference C[M, N] on host so the verifier touches every
+    // (m, n) tile slot dispatched across the 32 compute tiles. Per-tile output
+    // mapping bugs (a likely failure mode for whole-array fan-out) only show
+    // up away from the (0, 0) corner, so a corner-only check would silently
+    // pass them.
+    let mut c_ref = vec![0i32; MATMUL_I8_512_32C_M * MATMUL_I8_512_32C_N];
+    for r in 0..MATMUL_I8_512_32C_M {
+        for kk in 0..MATMUL_I8_512_32C_K {
+            let av = a_host[r * MATMUL_I8_512_32C_K + kk] as i32;
+            if av == 0 {
+                continue;
             }
+            let row_base = r * MATMUL_I8_512_32C_N;
+            let b_base = kk * MATMUL_I8_512_32C_N;
+            for c in 0..MATMUL_I8_512_32C_N {
+                c_ref[row_base + c] += av * b_host[b_base + c] as i32;
+            }
+        }
+    }
+
+    let mut errors = 0usize;
+    let mut first_bad: Option<(usize, usize, i32, i32)> = None;
+    for r in 0..MATMUL_I8_512_32C_M {
+        for c in 0..MATMUL_I8_512_32C_N {
             let off = (r * MATMUL_I8_512_32C_N + c) * 4;
             let bytes: [u8; 4] = outp[off..off + 4].try_into().unwrap();
             let got = i32::from_le_bytes(bytes);
+            let want = c_ref[r * MATMUL_I8_512_32C_N + c];
             if got != want {
                 if first_bad.is_none() {
                     first_bad = Some((r, c, want, got));
@@ -206,20 +222,22 @@ fn main() -> ExitCode {
             }
         }
     }
+    let total_elems = MATMUL_I8_512_32C_M * MATMUL_I8_512_32C_N;
     if errors == 0 {
         let macs = 2.0 * MATMUL_I8_512_32C_M as f64
             * MATMUL_I8_512_32C_K as f64
             * MATMUL_I8_512_32C_N as f64;
         let gops = macs / (single_us as f64 / 1e6) / 1e9;
-        println!("[mm8_512_32c] CORRECTNESS PASS — first {n_check}x{n_check} block matches");
+        println!(
+            "[mm8_512_32c] CORRECTNESS PASS - all {total_elems} output elements match"
+        );
         println!(
             "[mm8_512_32c] single dispatch: {single_us} us -> {gops:.2} GOp/s on {} GMACs",
             macs as u64 / 1_000_000_000
         );
     } else {
         println!(
-            "[mm8_512_32c] CORRECTNESS FAIL: {errors}/{} mismatches; first {first_bad:?}",
-            n_check * n_check
+            "[mm8_512_32c] CORRECTNESS FAIL: {errors}/{total_elems} mismatches; first {first_bad:?}"
         );
         return ExitCode::FAILURE;
     }
