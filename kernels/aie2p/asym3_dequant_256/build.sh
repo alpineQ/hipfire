@@ -51,22 +51,28 @@ echo "[1/2] clang++ --target=aie2p-none-unknown-elf -std=c++20 -c asym3_dequant_
     -c asym3_dequant_kernel.cc \
     -o build/asym3_dequant_kernel.o
 
-# Step 2 — Lower aie.mlir + link kernel object → PDI / insts.bin / xclbin.
-# aiecc is a single C++ binary that runs the whole MLIR pipeline + bootgen
-# + xclbin packaging in-process, no per-stage shell-out needed.
-echo "[2/2] aiecc --aie-generate-pdi --aie-generate-npu-insts --aie-generate-xclbin aie.mlir"
+# Step 2 — Lower aie.mlir + link kernel object → xclbin (containing PDI).
+# Uses canonical aiecc invocation matching mlir-aie programming examples.
+# The xclbin is a zip; PDI extracts via a follow-up unzip.
+echo "[2/2] aiecc --aie-generate-xclbin --aie-generate-npu-insts aie.mlir"
 cd build
 "$AIECC_BIN" \
-    --aie-generate-pdi \
-    --aie-generate-npu-insts \
     --aie-generate-xclbin \
+    --aie-generate-npu-insts \
     --no-compile-host \
     --no-xchesscc --no-xbridge \
-    --device-name=npu2 \
     --xclbin-name=asym3_dequant.xclbin \
     --npu-insts-name=insts.bin \
-    --pdi-name=main.pdi \
     "$SRCDIR/aie.mlir"
+
+# Extract PDI + JSON manifests from the xclbin (zip format) so they
+# can be embedded directly via crates/hipx/src/kernels.rs.
+echo
+echo "[2.5] unzip PDI + JSON from xclbin"
+unzip -o asym3_dequant.xclbin -d _unpacked >/dev/null
+cp _unpacked/main.pdi main.pdi 2>/dev/null || true
+cp _unpacked/main_aie_partition.json main_aie_partition.json 2>/dev/null || true
+cp _unpacked/main_kernels.json main_kernels.json 2>/dev/null || true
 
 echo
 echo "Built artifacts:"
