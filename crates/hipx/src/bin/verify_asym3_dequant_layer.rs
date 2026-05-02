@@ -166,10 +166,13 @@ fn main() -> ExitCode {
     let n_seeds: usize = std::env::args().nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SEEDS);
+    // Empirical envelope post codex codebook RNE fix: max ULP 2, mean
+    // signed +0.0088 to +0.0102 across 1000-seed runs. Bounds tightened
+    // from (4, 1.0) per MANUAL_REVIEW.md OPEN-2.
     let max_ulp_bound: u32 = std::env::var("ASYM3_LAYER_MAX_ULP")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(2);
     let mean_bias_bound: f64 = std::env::var("ASYM3_LAYER_MEAN_BIAS")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(0.5);
 
     let pdi = load_pdi();
     let insts = load_insts();

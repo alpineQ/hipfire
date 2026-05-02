@@ -1,0 +1,113 @@
+# Stage 1.5 NPU dispatch throughput + scoping decision
+# Captured 2026-05-02 against commit c94a880
+# Hardware: hipx (Strix Halo / gfx1151 iGPU + AIE-2P NPU)
+
+## Scoping decision
+
+Per the NPU roadmap contract: "stage 1.3a/1.3b validated the engine
+API but NOT yet the integration of NpuRuntime::asym3_dequant_256
+into the actual K-cache decode hot path. Stage 1.5 may require:
+  - First wiring the NPU dequant call into the engine forward path
+  - OR: just measure dispatch throughput / iGPU non-interference
+    without integration; then defer integration to 1.4 / additional
+    stage.
+Decide which is realistic for the iteration budget; document the
+decision in NPU_PROGRESS.md before benching."
+
+Decision: defer hot-path integration. The current single-core layer
+kernel is N_ITERS=1024 single-shape; production needs variable N
+(or multiple shape variants) AND multi-core fan-out. Plugging the
+current kernel into the hot path would force every decode step to
+issue ~32 dispatches per layer (32768/1024) at 2.46 ms/dispatch =
+~79 ms/layer = ~3.6 s/token vs the iGPU baseline 67 ms/token. That
+is a 54x regression and not informative as a "lift" measurement.
+
+Action: measure NPU standalone dispatch throughput + iGPU baseline
+separately. Document. Defer integration to a follow-on stage that
+also delivers (a) multi-shape variants OR runtime-parameterized N
+in the kernel, (b) multi-core fan-out (32 cores, 32x compute
+parallelism), and (c) prefetch wiring (NPU dispatches layer N+1
+while iGPU computes layer N).
+
+## NPU dispatch throughput (release build, N_ITERS=1024)
+
+Source: ./target/release/verify_asym3_dequant_layer 1000
+
+  1000 seeds x 2 dispatches per seed = 2000 dispatches
+  Wall clock: 4.928 s
+  Per-dispatch: 2.46 ms (release, includes BO map+sync per call)
+  Per-(head, position) effective: 2.46 ms / 1024 = 2.4 us
+
+  Determinism: PASS across all 1000 seeds (run1 == run2)
+  Max ULP: 2 (bound 4)
+  Mean signed: +0.0088 (bound 1.0)
+
+## Projection to 27B Gemma decode
+
+Per-layer dequant work: n_kv_heads x seq_len chunks
+  seq_len=128:   8 * 128  = 1024 chunks  = 1 dispatch  = 2.46 ms
+  seq_len=512:   8 * 512  = 4096 chunks  = 4 dispatches = 9.84 ms
+  seq_len=1024:  8 * 1024 = 8192 chunks  = 8 dispatches = 19.7 ms
+  seq_len=2048:  8 * 2048 = 16384 chunks = 16 dispatches = 39.4 ms
+  seq_len=4096:  8 * 4096 = 32768 chunks = 32 dispatches = 78.6 ms
+
+Per-token: 46 layers * per-layer:
+  seq_len=128:   113 ms/token  (1.7x slower than iGPU baseline 67 ms)
+  seq_len=4096:  3.62 s/token  (54x slower than iGPU baseline)
+
+iGPU baseline (gfx1151, 27B MQ4, asym3 KV, HIPFIRE_GRAPH=1):
+  pp32 prefill:  163.2 tok/s  (6.1 ms/token)
+  decode:         14.9 tok/s  (67.1 ms/token)
+  pp128 prefill: 167.3 tok/s
+
+DFlash 27B-3.5 LRU code:  83.76 tok/s  (11.9 ms/token)
+DFlash 27B-3.5 merge_sort: 105.47 tok/s (9.5 ms/token)
+
+## Conclusion
+
+Single-core single-shape layer kernel does not produce a useful
+stage 1.5 A/B at production seq_len. The dispatch latency dominates
+real iGPU compute by 50x+ at full context. Stage 1.5 lift gate
+(meaningful + repeatable + quality-clean -> flip default) cannot
+land with the current kernel topology.
+
+Per the contract escalation rule: "If lift is < 5% or quality
+drifts: do not flip default. Escalate to MANUAL_REVIEW.md with
+telemetry; stage 2.6 (fused score) may be the right next move
+instead."
+
+Required follow-on work (carried in tasks #40 + new):
+  1. Multi-core MLIR rewrite (4-32 core fan-out across the AIE
+     compute tile array). Estimated 4-12 hours of focused MLIR
+     authoring, modeled on programming_examples/basic/matrix_
+     multiplication/whole_array/aie_*_4c.mlir.
+  2. Variable-shape dispatch: shape-specialized kernel variants
+     (N=128, 512, 1024, 2048, 4096) OR runtime-N parameterization.
+     Multi-shape is simpler to author (just bump constants and
+     rebuild) but balloons binary size. Single-N runtime parameter
+     requires MLIR refactor.
+  3. Engine hot-path wiring: env-gated branch in
+     crates/engine/src/triattn.rs:Mode::Asym3 that calls
+     NpuRuntime::asym3_dequant_layer + triattn_score_bf16 instead
+     of triattn_score_asym3 when HIPFIRE_NPU_DEQUANT=1. Each
+     decode step picks the smallest shape variant >= seq_len,
+     pads with zeros, and reads back the valid portion.
+  4. Prefetch wiring: kick off layer N+1 NPU dispatch on its own
+     stream while iGPU runs layer N. Async fence per dispatch.
+
+Stage 2.6 fused score is the actual perf lever (per contract).
+Plain dequant offload barely covers triattn's dequant compute
+(~10% of total per-layer work; the Givens + RoPE + atan2/cos/sin/
+sqrt is the heavy compute). Fused asym3-on-NPU score would offload
+that whole pipeline.
+
+## Artifacts
+
+  Verifier:             crates/hipx/src/bin/verify_asym3_dequant_layer.rs
+  NPU layer kernel:     kernels/aie2p/asym3_dequant_layer/
+  Engine API:           crates/engine/src/npu.rs::asym3_dequant_layer
+  iGPU companion:       kernels/src/triattn_score_bf16.hip
+  Bf16 dispatch wrap:   crates/rdna-compute/src/dispatch.rs::triattn_score_bf16
+  Bf16 parity test:     crates/engine/examples/triattn_gpu_parity_bf16.rs
+
+All correctness gates closed. Performance integration deferred.

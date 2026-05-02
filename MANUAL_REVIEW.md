@@ -1,6 +1,16 @@
 # Manual Review Queue (npu-roadmap/2026-05-02)
 
-## OPEN-2: Tighten verifier bounds from (4, 1.0) to (2, 0.5)
+## RESOLVED-2: Tighten verifier bounds from (4, 1.0) to (2, 0.5)
+
+Resolved 2026-05-02 (commit forthcoming). The 1000-seed layer
+verifier shows max ULP 2 / mean +0.0088, the shadow harness shows
+max ULP 2 / mean -0.02 (per-layer max bias +0.24). Bounds tightened
+to (2, 0.5) in:
+  - crates/hipx/src/bin/verify_asym3_dequant.rs::main
+  - crates/hipx/src/bin/verify_asym3_dequant_layer.rs::main
+  - crates/engine/examples/hipfire_x_asym3_shadow.rs env defaults
+
+Original record below for context:
 
 **Stage**: 1.1 (post codex review fixes, commit 5adfd07)
 

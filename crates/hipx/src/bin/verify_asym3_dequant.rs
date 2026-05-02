@@ -767,8 +767,13 @@ fn main() -> ExitCode {
     // ASYM3_STRICT=1: enforce true bit-for-bit (max_ulp == 0).
     // Reserved for the future LUT-based verifier.
     let strict = std::env::var("ASYM3_STRICT").is_ok();
-    let max_ulp_bound: u32 = if strict { 0 } else { 4 };
-    let mean_bias_bound: f64 = if strict { 0.0 } else { 1.0 };
+    // Empirical envelope post codex codebook RNE fix (commit 5adfd07):
+    // max_ulp = 2, mean signed = -0.06 to +0.02 across all measurements
+    // (verify, shadow, and layer verifiers). 1 ULP of headroom over the
+    // empirical max and ~10x of headroom over the empirical mean.
+    // See MANUAL_REVIEW.md OPEN-2 for the rationale.
+    let max_ulp_bound: u32 = if strict { 0 } else { 2 };
+    let mean_bias_bound: f64 = if strict { 0.0 } else { 0.5 };
 
     let mut total_seeds_ok = 0usize;
     let mut total_seeds_fail = 0usize;
