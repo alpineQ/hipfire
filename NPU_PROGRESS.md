@@ -5,8 +5,8 @@
 | Stage | State | Branch |
 |-------|-------|--------|
 | 1.1 Correctness verifier | DONE (3-gate acceptance, AIE-2P-shape doc'd) | npu-roadmap/2026-05-02 |
-| 1.2 Embed PDI | next up | feat/npu-stage-1.2-embed-pdi |
-| 1.3 Engine wiring | blocked on 1.2 | feat/npu-stage-1.3-engine-wiring |
+| 1.2 Embed PDI | DONE (PDI+insts in kernels.rs; 100/100 verifier still PASS) | npu-roadmap/2026-05-02 |
+| 1.3 Engine wiring | next up | feat/npu-stage-1.3-engine-wiring |
 | 1.5 Bench | blocked on 1.3 | feat/npu-stage-1.5-bench |
 | 2.6 Fused score | blocked on 1.5 | feat/npu-stage-2.6-fused-score |
 | LUT-based bit-exact verifier (deferred) | future work | -- |
@@ -36,3 +36,4 @@ Plan:
 - 2026-05-02 stage 1.1 resolution path (proposed): change kernel to take bf16 cnorm directly + build empirical LUT of (cnorm_bf16, cb_idx) -> bf16_output via sweep. Bit-exact verifier by construction. Estimate: 1.5h work.
 - 2026-05-02 stage 1.1 DONE (principal accepted ULP-bounded gate proposal): three gates landed in verifier (determinism, max ULP <= 2, |mean signed| <= 0.5). 100/100 seeds PASS on hipx. AIE-2P-shape characterization filed at docs/plans/aie2p-bf16-mul-shape.md. Strict bit-for-bit preserved as ASYM3_STRICT=1 toggle. LUT-based verifier deferred to future work.
 - 2026-05-02 stage 1.2 starting: embed main.pdi + insts.bin via include_bytes! in crates/hipx/src/kernels.rs. Pattern matches existing matmul_i8 entries.
+- 2026-05-02 stage 1.2 DONE: ASYM3_DEQUANT_256_{PDI,INSTS} added to crates/hipx/src/kernels.rs. Verifier defaults to embedded; ASYM3_PDI / ASYM3_INSTS env vars override with file paths for kernel-rebuild iteration. Committed binary artifacts (PDI 2784 B, insts 420 B). 100/100 seeds still PASS on hipx with embedded PDI. Next: stage 1.3 engine wiring under HIPFIRE_NPU_DEQUANT flag.
