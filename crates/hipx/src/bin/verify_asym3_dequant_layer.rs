@@ -167,10 +167,12 @@ fn main() -> ExitCode {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SEEDS);
     // Empirical envelope post codex codebook RNE fix: max ULP 2, mean
-    // signed +0.0088 to +0.0102 across 1000-seed runs. Bounds tightened
-    // from (4, 1.0) per MANUAL_REVIEW.md OPEN-2.
+    // signed +0.0088 to +0.0102 across 1000-seed runs. Bound = 3 gives
+    // 1 ULP headroom over empirical max; mean bound 0.5 is ~10x
+    // headroom over empirical mean. Tightened from (4, 1.0) per
+    // MANUAL_REVIEW.md OPEN-2.
     let max_ulp_bound: u32 = std::env::var("ASYM3_LAYER_MAX_ULP")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(3);
     let mean_bias_bound: f64 = std::env::var("ASYM3_LAYER_MEAN_BIAS")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(0.5);
 

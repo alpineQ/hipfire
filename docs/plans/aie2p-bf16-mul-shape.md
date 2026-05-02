@@ -92,11 +92,12 @@ Stage 1.1 currently uses a third path:
     fictional hardware model:
 
     1. **Determinism**: same input twice -> same output.
-    2. **Max bf16 ULP per element <= 2** across 100+ random seeds
+    2. **Max bf16 ULP per element <= 3** across 100+ random seeds
        (1 ULP of headroom over the empirical max of 2). Catches
        structural bugs (codebook precision, layout, unpack,
        off-by-one) which produce errors much larger than the
-       few-ULP hardware rounding floor.
+       few-ULP hardware rounding floor; the headroom guards
+       against single-measurement noise tripping the gate.
     3. **|mean signed ULP error| <= 0.5** across all diff'd
        elements (~10x headroom over the empirical ~0.05). Catches
        large-magnitude systematic-bias bugs.

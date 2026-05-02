@@ -769,10 +769,12 @@ fn main() -> ExitCode {
     let strict = std::env::var("ASYM3_STRICT").is_ok();
     // Empirical envelope post codex codebook RNE fix (commit 5adfd07):
     // max_ulp = 2, mean signed = -0.06 to +0.02 across all measurements
-    // (verify, shadow, and layer verifiers). 1 ULP of headroom over the
-    // empirical max and ~10x of headroom over the empirical mean.
-    // See MANUAL_REVIEW.md OPEN-2 for the rationale.
-    let max_ulp_bound: u32 = if strict { 0 } else { 2 };
+    // (verify, shadow, and layer verifiers). Bound = 3 gives 1 ULP of
+    // headroom over the empirical max so a single rogue measurement
+    // does not flake the gate; structural bugs produce >>2 ULP errors
+    // and are still caught. Mean bound 0.5 = ~10x headroom over the
+    // empirical mean. See MANUAL_REVIEW.md OPEN-2.
+    let max_ulp_bound: u32 = if strict { 0 } else { 3 };
     let mean_bias_bound: f64 = if strict { 0.0 } else { 0.5 };
 
     let mut total_seeds_ok = 0usize;

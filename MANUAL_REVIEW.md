@@ -1,16 +1,24 @@
 # Manual Review Queue (npu-roadmap/2026-05-02)
 
-## RESOLVED-2: Tighten verifier bounds from (4, 1.0) to (2, 0.5)
+## RESOLVED-2: Tighten verifier bounds from (4, 1.0) to (3, 0.5)
 
-Resolved 2026-05-02 (commit forthcoming). The 1000-seed layer
-verifier shows max ULP 2 / mean +0.0088, the shadow harness shows
-max ULP 2 / mean -0.02 (per-layer max bias +0.24). Bounds tightened
-to (2, 0.5) in:
+Resolved 2026-05-02. The 1000-seed layer verifier shows max ULP 2 /
+mean +0.0088, the shadow harness shows max ULP 2 / mean -0.02
+(per-layer max bias +0.24). Bounds tightened to (3, 0.5) in:
   - crates/hipx/src/bin/verify_asym3_dequant.rs::main
   - crates/hipx/src/bin/verify_asym3_dequant_layer.rs::main
   - crates/engine/examples/hipfire_x_asym3_shadow.rs env defaults
+  - docs/plans/aie2p-bf16-mul-shape.md envelope description
 
-Original record below for context:
+Codex caught that an initial tighten to (2, 0.5) had zero
+headroom over the empirical max and would flake on a single
+rogue measurement. Final landing bound = 3 gives 1 ULP of
+headroom while still catching structural bugs (which produce
+>>2 ULP errors).
+
+Original record below for context (the recommendation field's
+"1 ULP headroom" math was off by 1: bound 2 == empirical max 2,
+zero headroom; bound 3 gives the actual 1 ULP):
 
 **Stage**: 1.1 (post codex review fixes, commit 5adfd07)
 
