@@ -46,6 +46,22 @@ fn main() {
         let uniform = bits as f32 / (1u32 << 24) as f32;
         uniform * 2.0 - 1.0
     }
+    fn f32_to_bf16_rtz(x: f32) -> u16 {
+        let xb = x.to_bits();
+        if (xb & 0x7fff_ffff) > 0x7f80_0000 {
+            return ((xb >> 16) | 0x0040) as u16;
+        }
+        (xb >> 16) as u16
+    }
+    fn f32_to_bf16_rne(x: f32) -> u16 {
+        let xb = x.to_bits();
+        if (xb & 0x7fff_ffff) > 0x7f80_0000 {
+            return ((xb >> 16) | 0x0040) as u16;
+        }
+        let lsb = (xb >> 16) & 1;
+        let bias = 0x7fff + lsb;
+        ((xb.wrapping_add(bias)) >> 16) as u16
+    }
     fn f32_to_bf16_raz(x: f32) -> u16 {
         let xb = x.to_bits();
         if (xb & 0x7fff_ffff) > 0x7f80_0000 {
@@ -56,6 +72,7 @@ fn main() {
         let biased = abs.wrapping_add(0xffff);
         ((sign | (biased & 0x7fff_ffff)) >> 16) as u16
     }
+    fn bf16_to_f32(b: u16) -> f32 { f32::from_bits((b as u32) << 16) }
 
     let mut centers = TriAttnCenters::new(1, n_heads, head_dim, rope_theta, partial_rotary_factor);
     let mut seed = 0xdeadbeefu64;
@@ -128,6 +145,16 @@ fn main() {
     let k_bytes_per_pos = n_kv_heads * k_bytes_per_head;
     let bf16_per_pos = n_kv_heads * head_dim;
     let mut bf16_k = vec![0u16; seq_len * bf16_per_pos];
+    // AIE-2P-shape dequant model (matches NpuRuntime::asym3_dequant_layer):
+    //   cnorm: f32 -> bf16 RTZ (kernel runtime (bfloat16)*float_ptr cast)
+    //   codebook: f32 -> bf16 RNE (compile-time bfloat16 ctor)
+    //   product: f32 mul of (cnorm_bf16 -> f32) * (cb_bf16 -> f32)
+    //   output: f32 -> bf16 RAZ
+    // See docs/plans/aie2p-bf16-mul-shape.md and
+    // crates/hipx/src/bin/verify_asym3_dequant.rs::cpu_reference.
+    let cb_bf16_f32: [f32; 8] = std::array::from_fn(|i|
+        bf16_to_f32(f32_to_bf16_rne(LLOYD_C3_256[i]))
+    );
     for pos in 0..seq_len {
         for h_kv in 0..n_kv_heads {
             let head_off = pos * k_bytes_per_pos + h_kv * k_bytes_per_head;
@@ -137,6 +164,7 @@ fn main() {
                 k_cache_bytes[head_off + 2],
                 k_cache_bytes[head_off + 3],
             ]);
+            let cnorm_b = bf16_to_f32(f32_to_bf16_rtz(cnorm));
             for tid in 0..32usize {
                 let base_off = head_off + 4 + tid * 3;
                 let b0 = k_cache_bytes[base_off] as u32;
@@ -145,7 +173,7 @@ fn main() {
                 let packed = b0 | (b1 << 8) | (b2 << 16);
                 for i in 0..8 {
                     let idx = ((packed >> (i * 3)) & 7) as usize;
-                    let v = cnorm * LLOYD_C3_256[idx];
+                    let v = cnorm_b * cb_bf16_f32[idx];
                     let dim = tid * 8 + i;
                     let dst = pos * bf16_per_pos + h_kv * head_dim + dim;
                     bf16_k[dst] = f32_to_bf16_raz(v);
