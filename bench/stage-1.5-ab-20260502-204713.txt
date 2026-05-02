@@ -1,0 +1,10 @@
+Stage 1.5 A/B bench 20260502-204713
+seq_len=128 n_chunks=1024 n_trials=100
+path_a_median_us=17.03
+path_a_p95_us=17.64
+path_b_median_us=1371.95
+path_b_p95_us=1632.45
+path_b_npu_median_us=1241.46
+path_b_upload_median_us=97.26
+path_b_score_median_us=24.77
+lift_pct=-7955.11

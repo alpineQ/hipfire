@@ -1,6 +1,54 @@
 # Manual Review Queue (npu-roadmap/2026-05-02)
 
-## ESCALATED-4: Stage 2.6 fused score is correct but not competitive
+## ESCALATED-5: Stage 1.5 measured A/B (final, 2026-05-02)
+
+The earlier escalations (ESCALATED-3 + ESCALATED-4) were
+projection-based. This is the actual measurement on hipx (Strix
+Halo, gfx1151 iGPU + AIE-2P NPU2):
+
+  bench/stage-1.5-ab-20260502-204713.txt
+  Workload: seq_len=128, 8 kv_heads x 128 pos = 1024 chunks/dispatch
+  100 trials, release build, warm cache
+
+  Path A (iGPU baseline, triattn_score_asym3 inline):
+    median:  17.03 us
+    p95:     17.64 us
+
+  Path B (NPU asym3_dequant_layer + iGPU triattn_score_bf16):
+    median:  1371.95 us  (80x slower than Path A)
+    p95:     1632.45 us
+    breakdown:
+      NPU asym3_dequant_layer:   1241 us  (90.5% of total)
+      bf16 K upload host->iGPU:    97 us  ( 7.1% of total)
+      iGPU triattn_score_bf16:     25 us  ( 1.8% of total)
+
+The iGPU baseline at 17 us is dramatically faster than projection
+math suggested. The iGPU's fused dequant + Givens + RoPE + score
+is a single-pass GEMV-shape kernel that's well-tuned for gfx1151.
+
+Even hypothetical 16-core SIMD-optimized NPU dequant
+(1241 us / 16 = 78 us) + upload (97 us) + bf16 score (25 us) =
+200 us total Path B vs 17 us Path A. Still 12x slower.
+
+**Decision**: Stage 1.5 closes definitively as no-lift, with
+measured numbers. Default `HIPFIRE_NPU_DEQUANT` stays 0. The
+NPU dequant offload is fundamentally not competitive even with
+the most optimistic optimization stack assumptions.
+
+Why the projection was off:
+  - Plan-doc per-iter estimate was 322 cycles. Reality (single
+    core, scalar, packed input layout) is ~1240 us / 1024 iters
+    = 1.2 us per iter = ~1900 cycles. 6x higher than estimate.
+  - iGPU baseline assumed 67 ms/token from speed-baselines.
+    Per-token triattn cost (per-layer × 46 layers) is much
+    smaller than the full-token decode, ~17 us × 46 = 0.78 ms.
+    iGPU is far better at this than the baseline number suggested.
+
+Committed bench harness at
+`crates/engine/examples/hipfire_x_stage_1_5_ab.rs`; rerun any time
+to re-validate.
+
+
 
 **Stage**: 2.6 (post correctness shipping)
 
