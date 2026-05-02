@@ -35,6 +35,12 @@
 #include <aie_api/aie.hpp>
 #include <stdint.h>
 
+// Peano's aie2p math.h only declares fabs/fabsf/fabsl. libm.a
+// has the rest of the symbols but no header. Forward-declare
+// sqrtf so clang++ accepts the call; aiecc links libm.a in the
+// final kernel ELF.
+extern "C" float sqrtf(float);
+
 // Codebook stays f32 in the score kernel. Unlike asym3_dequant_layer
 // (which writes bf16 K and so must match the AIE-2P bf16 mul-and-store
 // shape with a bf16 codebook), the score kernel produces an f32 output
@@ -117,9 +123,11 @@ void asym3_score_one(
 
       // s_norm still needs k_mag.
       float k_mag2 = k_re * k_re + k_im * k_im;
-      // Use Peano libm sqrtf; SIMD aie::sqrt comes in the
-      // optimized variant once correctness is proven.
-      float k_mag = __builtin_sqrtf(k_mag2);
+      // Peano libm scalar sqrtf; SIMD aie::sqrt comes in the
+      // optimized variant once correctness is proven. The
+      // __builtin_sqrtf variant fails to legalize on aie2p
+      // ("unable to legalize instruction: G_FSQRT").
+      float k_mag = sqrtf(k_mag2);
 
       float r = (c_abs[f] > 1e-20f) ? (c_mag[f] / c_abs[f]) : 0.0f;
       if (r > 1.0f) r = 1.0f;
