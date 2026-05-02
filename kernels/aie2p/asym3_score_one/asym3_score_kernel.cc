@@ -35,11 +35,14 @@
 #include <aie_api/aie.hpp>
 #include <stdint.h>
 
-static const bfloat16 TURBO_C3[8] = {
-    bfloat16(-0.134860f), bfloat16(-0.083320f),
-    bfloat16(-0.046469f), bfloat16(-0.015176f),
-    bfloat16(+0.015176f), bfloat16(+0.046469f),
-    bfloat16(+0.083320f), bfloat16(+0.134860f),
+// Codebook stays f32 in the score kernel. Unlike asym3_dequant_layer
+// (which writes bf16 K and so must match the AIE-2P bf16 mul-and-store
+// shape with a bf16 codebook), the score kernel produces an f32 output
+// scalar and never stores bf16. Matching the iGPU triattn_score_asym3
+// reference means f32 codebook + f32 cnorm + f32 mul throughout.
+static const float TURBO_C3[8] = {
+    -0.134860f, -0.083320f, -0.046469f, -0.015176f,
+    +0.015176f, +0.046469f, +0.083320f, +0.134860f,
 };
 
 constexpr int HEAD_DIM = 256;
@@ -72,9 +75,11 @@ void asym3_score_one(
     float   *sin_theta,     // 128 f32
     float   *score_out      // 1 f32 output
 ) {
-  // Convert cnorm to bf16 once (matches AIE-2P-shape model).
-  bfloat16 cnorm = (bfloat16)(*cnorm_ptr);
-  float cnorm_f = (float)cnorm;
+  // cnorm and codebook stay f32 (no bf16 round-trip): the iGPU
+  // reference runs in f32 throughout and the score output is f32,
+  // so any bf16 truncation here is pure precision loss with zero
+  // hardware-shape benefit.
+  float cnorm_f = *cnorm_ptr;
 
   float s_trig = 0.0f;
   float s_norm = 0.0f;
@@ -85,11 +90,11 @@ void asym3_score_one(
     int8_t idx_buf[N_DIMS_PER_TID];
     unpack_indices_for_thread(packed + tid * 3, idx_buf);
 
-    // Dequant 8 dims for this tid -> v[0..8]
+    // Dequant 8 dims for this tid -> v[0..8] in f32, matching the
+    // iGPU triattn_score_asym3 reference exactly.
     float v[N_DIMS_PER_TID];
     for (int i = 0; i < N_DIMS_PER_TID; ++i) {
-      bfloat16 cb = TURBO_C3[idx_buf[i]];
-      v[i] = cnorm_f * (float)cb;
+      v[i] = cnorm_f * TURBO_C3[idx_buf[i]];
     }
 
     // 4 band pairs per tid (since 8 dims = 4 complex bands).
