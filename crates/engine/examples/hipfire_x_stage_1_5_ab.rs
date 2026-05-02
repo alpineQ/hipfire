@@ -27,12 +27,16 @@
 //! Build:
 //!   cargo run -p engine --features deltanet --example hipfire_x_stage_1_5_ab
 
-#[cfg(not(feature = "deltanet"))]
+// Requires both `deltanet` (for KvCache::new_gpu_asym3 + TriAttn types)
+// and `npu` (for engine::npu::NpuRuntime, gated behind dep:hipx). Build:
+//   cargo run -p engine --features deltanet,npu --release \
+//     --example hipfire_x_stage_1_5_ab
+#[cfg(not(all(feature = "deltanet", feature = "npu")))]
 fn main() {
-    eprintln!("build with --features deltanet");
+    eprintln!("build with --features deltanet,npu");
 }
 
-#[cfg(feature = "deltanet")]
+#[cfg(all(feature = "deltanet", feature = "npu"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use engine::llama::KvCache;
     use engine::npu::NpuRuntime;
