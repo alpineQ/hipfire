@@ -1,0 +1,52 @@
+# asym3_dequant_256 dispatch latency characterization
+#
+# Date: 2026-05-02
+# Branch: npu-roadmap/2026-05-02 @ commit 3cf2c31 (post-1.3b)
+# Hardware: hipx (Strix Halo NPU2, AIE 1.1, fw 1.1.2 build 65)
+# Build: cargo --release -p engine --features npu --example hipfire_x_asym3_shadow
+#
+# Purpose: characterize the per-dispatch latency of the 1.1 verifier
+# kernel asym3_dequant_256 (single-(head, position) granularity) to
+# quantify why the production kernel must be per-layer batched (Tier 1
+# stage 1.4 work) before stage 1.5 A/B can produce a real tok/s number.
+
+# Run 1: 16 layers x 8 heads x 8 positions = 1024 dispatches
+n_dispatches=1024
+wall_clock_seconds=0.069
+us_per_dispatch=67.4
+max_ulp=3
+mean_signed_ulp=0.7144
+
+# Run 2: 46 layers x 8 heads x 8 positions = 2944 dispatches (27B decode shape, short context)
+n_dispatches=2944
+wall_clock_seconds=0.212
+us_per_dispatch=72.0
+max_ulp=3
+mean_signed_ulp=0.7294
+
+# Run 3: 46 layers x 8 heads x 32 positions = 11776 dispatches (1 token at seq=32)
+n_dispatches=11776
+wall_clock_seconds=0.834
+us_per_dispatch=70.8
+max_ulp=3
+mean_signed_ulp=0.7417
+
+# Linear extrapolation to realistic decode shapes:
+#   46 layers x 8 heads x 4096 positions = 1,507,328 dispatches
+#   estimated wall-clock at 70 us/dispatch = 105.5 seconds per token
+#   iGPU baseline (tests/speed-baselines/gfx1151.txt @ b1ab41f):
+#     27b mq4 gen tok_s = 14.9  ->  67.1 ms per token
+#   ratio: 105.5 s / 67.1 ms = 1573x SLOWER than iGPU at this granularity
+#
+# Conclusion: per-(head, position) dispatch granularity is fundamentally
+# wrong for production. Must batch per-layer (Tier 1 production kernel
+# asym3_dequant_layer) or per-forward-pass (Tier 2 fused score).
+#
+# Per the codec budget doc (docs/plans/asym3-codec-budget.md):
+#   asym3_dequant_layer compute @ 1.03 TOp/s BF16 = ~70 us / layer
+#   asym3_dequant_layer BW-bound writeback @ 30 GB/s = ~630 us / layer
+#   46 layers per token x 630 us = 29 ms total NPU dispatch time
+#   that fits inside the iGPU's 67 ms / token window for raw decode
+#
+# Stage 1.4 (asym3_dequant_layer kernel author) is the unlock. Spec at
+# docs/plans/asym3-tier1-layer-kernel.md.
