@@ -11,20 +11,25 @@ NPU-side codec.
 
 ## TL;DR
 
-**Per-layer dispatch is not profitable.** With 1024^3 INT8 at
-2.23 TOp/s and BF16 at 1.03 TOp/s through the engine API, a
-single layer's K dequant + scoring at 27B Gemma shapes is
-~16 µs of compute — 5–35× smaller than the dispatch overhead.
+**Per-layer dequant + K-prefetch pipeline is profitable for
+non-spec decode** (1457 µs iGPU layer hides the 630 µs NPU BW
+window with a 2.3× margin). Ship `asym3_dequant_layer_to_bf16`
+as Tier 1.
 
-**Full-forward-pass dispatch is profitable.** Batching all 46
-layers into one NPU call drops the dispatch fraction below 1 %.
-At that granularity, INT8 quant + dequant fuses cleanly into the
-existing 1024^3 GEMM kernel and runs at ~700 µs total — directly
-overlappable with the iGPU pipeline measured in
-`hipfire_x_overlap_rigor` (43 % wall-clock saved).
+**DFlash-batched decode needs the fused score kernel.** Post-rebase
+iGPU is 27 % faster (260 µs/layer instead of 330 µs), so the
+prefetch window no longer closes for the headline DFlash 27B-3.5
+workload. The fix is to drop the bf16 K writeback (84 % of the
+NPU I/O) by fusing dequant+score on NPU. Tier 2:
+`asym3_score_all_layers`.
 
-**Author the kernel as a forward-pass-batched dequant**, not a
-per-layer one. Per-layer routing keeps the iGPU path.
+**Hard prereq for either tier**: dmabuf import iGPU↔NPU
+(Task #9). Without zero-copy K cache access from NPU, the
+copy cost (~100 µs/layer) eats most of the DFlash budget.
+
+**Per-call dispatch (`kv_fold_asym3`, naive per-layer-per-token
+dequant) is not profitable** — dispatch overhead is 5–40×
+larger than the compute. Don't author these.
 
 ## Format details (engine source of truth)
 
@@ -169,9 +174,23 @@ the score reduction. This re-shapes the spec:
 
 ## Recommended kernel to author
 
-**`asym3_dequant_layer_to_bf16`** — operates on a single layer's
-K cache slice but dispatched ASYNC under the K-prefetch pipeline.
-Signature:
+**Two-tier authoring plan (revised 2026-05-02):**
+
+1. **Tier 1 — `asym3_dequant_layer_to_bf16`**: ships first as the
+   simpler kernel. Validated for *non-spec decode* and *prefill*
+   (1457 µs iGPU layer comfortably hides the 630 µs NPU BW window).
+   Lets us prove out the dispatch + dmabuf import + engine wiring
+   on a tractable kernel shape. Decoupling MLIR-AIE risk from
+   engine-integration risk.
+
+2. **Tier 2 — `asym3_score_all_layers` fused dequant + score**:
+   eliminates the bf16 K writeback (84 % of NPU I/O) which closes
+   the prefetch window for DFlash workloads (260 µs iGPU layer).
+   Compute density goes from 1 mul/element (BW-bound) to
+   `head_dim` MACs/element (compute-bound at 1.03 TOp/s BF16).
+   Higher MLIR-AIE risk; gated on Tier 1 shipping.
+
+Tier 1 kernel signature:
 
 ```rust
 pub fn asym3_dequant_layer(
@@ -262,18 +281,76 @@ LUT lookup, no inter-tile dependencies, easily mapped to the
     (where K cache reads grow linearly and the iGPU layer time
     stretches accordingly).
 
+  - **Refresh 2026-05-02 (post-rebase + ROCm 7.2.2):** master's
+    MMQ-auto + per-weight screen + gemv-fusion + k2x32 work
+    landed and lifted gfx1151 prefill +11–68 % across all sizes.
+    Decode is *unchanged* (BW-wall on weight reads — fundamental
+    LPDDR5X-8000 ≈ 256 GB/s ceiling). DFlash 27B-3.5 LRU code
+    workload is *faster*: 65.83 → 83.76 tok/s, τ 8.85 → 10.64.
+    New per-layer numbers from `tests/speed-baselines/gfx1151.txt`
+    @ commit `8759d93`:
+
+    ```
+    27b mq4 gen:               14.9 tok/s = 67 ms/token
+                              ÷ 46 layers = 1457 µs / layer  (UNCHANGED)
+    27b 3.5 dflash lru code:   83.76 tok/s with τ=10.64
+                              1000 / 83.76 / 46 = 260 µs / layer
+                              (was 330 µs; iGPU is 27 % faster
+                               so the NPU prefetch window tightens)
+    ```
+
+    Pure decode close still holds (2.3× margin). **DFlash-batched
+    close fails harder post-rebase**: 260 µs iGPU layer < 630 µs
+    NPU BW window. The K-prefetch pipeline as originally specced
+    cannot hide NPU dequant under DFlash workloads. Three options:
+
+    1. **Drop the bf16 K writeback** — fuse dequant+score on
+       NPU so only the smaller score output crosses the memory
+       subsystem. The 16 MiB bf16 K write is the dominant BW
+       term (3.2 MiB read + 16 MiB write = 19 MiB; the 16 MiB
+       writeback is 84 % of the I/O). Eliminating it brings the
+       NPU window from 630 µs to ~110 µs at 30 GB/s, well inside
+       the 260 µs DFlash budget. **Requires authoring the full
+       fused score kernel, not just dequant — i.e., the
+       `asym3_score_all_layers` path in the design refinement
+       below.**
+    2. **Keep the per-layer dequant kernel + skip prefetch
+       pipeline on DFlash decode** — gate offload to non-spec
+       paths (prefill, raw single-token decode, long-context
+       refresh). Loses the headline workload but ships the
+       simpler kernel.
+    3. **Restructure to batch multiple-layer dequant per call**
+       — amortize per-call BW across ≥3 layers so prefetch
+       headroom returns. Adds plumbing complexity but stays in
+       the dequant-only kernel shape.
+
+    **Recommendation: option (1).** The fused score kernel is
+    where the NPU's INT8/BF16 GEMM strength actually shows up —
+    a standalone dequant is bandwidth-bound on the writeback,
+    not compute-bound. The compute density of fused score is
+    roughly 8× the dequant kernel (head_dim MACs vs 1 mul per
+    output element), which directly shifts the kernel from
+    BW-bound to compute-bound and unlocks the 1.03 TOp/s BF16
+    headline. See revised plan under "Recommended kernel to
+    author" below.
+
 - **bf16 vs fp16**: engine uses fp16 in many spots, NPU produces
   bf16. Mantissa precision differs. Need to verify the score
   kernel's accuracy doesn't regress on bf16-dequanted K — likely
   fine (asym3 quant error is the dominant precision loss anyway,
   bf16 vs fp16 is third-order) but a coherence-gate run is a hard
   prereq before landing.
-- **bf16 vs fp16**: engine uses fp16 in many spots, NPU produces
-  bf16. Mantissa precision differs. Need to verify the score
-  kernel's accuracy doesn't regress on bf16-dequanted K — likely
-  fine (asym3 quant error is the dominant precision loss anyway,
-  bf16 vs fp16 is third-order) but a coherence-gate run is a hard
-  prereq before landing.
+
+- **K cache memory residency**: K cache is allocated through
+  ROCm/HSA on the iGPU side. NPU consumption requires either
+  (a) dmabuf import (Task #9, pending) — the K cache memory
+  mapped into NPU's address space, true zero-copy; (b) DMA copy
+  per layer at ~100 µs cost, eating most of the 260 µs DFlash
+  budget; or (c) re-allocating K cache through PASID-shared
+  SHMEM, which forces all asym3 ops (including the iGPU score
+  path) onto the same allocator. Path (a) is the only viable
+  route for production codec offload — **dmabuf import is the
+  hard prereq, not the kernel itself.**
 
 ## Pointers
 
