@@ -25,6 +25,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     fn f32_to_bf16_rtz(x: f32) -> u16 { (x.to_bits() >> 16) as u16 }
+    /// RNE matches the kernel's `bfloat16(f32_lit)` compile-time
+    /// constructor used to store codebook entries.
+    fn f32_to_bf16_rne(x: f32) -> u16 {
+        let xb = x.to_bits();
+        let lsb = (xb >> 16) & 1;
+        let bias = 0x7fff + lsb;
+        ((xb.wrapping_add(bias)) >> 16) as u16
+    }
     fn bf16_to_f32(b: u16) -> f32 { f32::from_bits((b as u32) << 16) }
     fn ulp_distance(a: u16, b: u16) -> u32 {
         let sa = a & 0x8000;
@@ -57,7 +65,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         rt.asym3_dequant_256(&packed, cnorm, &mut out)?;
 
-        let expected_bf16 = f32_to_bf16_rtz(TURBO_C3_256[k as usize]);
+        let expected_bf16 = f32_to_bf16_rne(TURBO_C3_256[k as usize]);
         let mut max_ulp_k: u32 = 0;
         for d in 0..256 {
             let observed = (out[d * 2] as u16) | ((out[d * 2 + 1] as u16) << 8);

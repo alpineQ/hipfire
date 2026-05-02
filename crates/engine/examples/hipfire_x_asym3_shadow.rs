@@ -75,13 +75,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if sc == sn { mn - mc } else { mn + mc }
     }
 
-    // CPU-side reference using the AIE-2P-shape model (RTZ cnorm,
-    // RAZ output). Mirrors crates/hipx/src/bin/verify_asym3_dequant
-    // exactly so the shadow harness applies the same gate.
+    // CPU-side reference using the AIE-2P-shape model: RTZ cnorm
+    // (kernel runtime cast), RNE codebook (kernel compile-time
+    // bfloat16 ctor matches RNE), RAZ output. Mirrors
+    // crates/hipx/src/bin/verify_asym3_dequant.
+    fn f32_to_bf16_rne(x: f32) -> u16 {
+        let xb = x.to_bits();
+        let lsb = (xb >> 16) & 1;
+        let bias = 0x7fff + lsb;
+        ((xb.wrapping_add(bias)) >> 16) as u16
+    }
     fn cpu_reference(packed: &[u8; 96], cnorm: f32, out: &mut [u16; 256]) {
         let cnorm_b = bf16_bits_to_f32(f32_to_bf16_rtz(cnorm));
         let cb_b: [f32; 8] = std::array::from_fn(|i|
-            bf16_bits_to_f32(f32_to_bf16_rtz(TURBO_C3_256[i]))
+            bf16_bits_to_f32(f32_to_bf16_rne(TURBO_C3_256[i]))
         );
         for tid in 0..32usize {
             let base = tid * 3;

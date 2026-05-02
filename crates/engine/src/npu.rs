@@ -201,9 +201,14 @@ impl NpuRuntime {
         // Kernel availability is compile-time today (we embed PDI bytes
         // in hipx::kernels). Phase 2 will swap this for runtime probes
         // when we add dynamic PDI loading.
+        //
+        // kv_dequant is true: the asym3_dequant_256 PDI ships in the
+        // binary via include_bytes! (stage 1.2). The lazy init inside
+        // asym3_dequant_256() handles first-call hwctx + BO setup,
+        // but availability for routing is unconditional.
         let available_ops = AvailableOps {
             passthrough_4k: true,
-            kv_dequant: false,
+            kv_dequant: true,
             int8_gemm: false,
         };
         Some(Self {
@@ -252,8 +257,14 @@ pub fn route(npu: &Option<NpuRuntime>, op: OpClass) -> ComputeTarget {
     let pdi_available = match op {
         OpClass::KvCodec => {
             // Two gates: the kernel must be loaded AND the runtime
-            // flag must be set. Default off; flip once 1.5 ships.
-            rt.available_ops.kv_dequant && std::env::var("HIPFIRE_NPU_DEQUANT").is_ok()
+            // flag must explicitly be "1". Default off; flip once 1.5
+            // ships. Explicit value parse so HIPFIRE_NPU_DEQUANT=0
+            // (or empty) reliably disables the path; mere presence
+            // of the var is not enough.
+            rt.available_ops.kv_dequant
+                && std::env::var("HIPFIRE_NPU_DEQUANT")
+                    .map(|v| v == "1")
+                    .unwrap_or(false)
         }
         OpClass::Int8Gemm { .. } => rt.available_ops.int8_gemm,
         // Other op classes have no NPU kernel yet.

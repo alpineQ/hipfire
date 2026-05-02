@@ -202,11 +202,14 @@ fn cpu_reference(packed: &[u8], cnorm: f32, out_bf16: &mut [u16]) {
     let cnorm_bf16 = f32_to_bf16_bits_rtz(cnorm);
     let cnorm_b = bf16_bits_to_f32(cnorm_bf16);
 
-    // Codebook bf16 reps confirmed byte-identical between kernel and
-    // CPU via calibration; RTZ and RNE happen to agree on TURBO_C3_256.
-    // Use RTZ here for consistency with the cnorm conversion.
+    // Codebook conversion is RNE (matches the C++ `bfloat16(f32_lit)`
+    // compile-time conversion that stores the kernel constants). Earlier
+    // assumption that RNE == RTZ was wrong: idx in {1, 3, 4, 6} have
+    // f32 dropped bits >= 0x8000 so RNE rounds magnitude up while RTZ
+    // truncates. Calibration verified the kernel's bf16 codebook is
+    // RNE-rounded, not RTZ-truncated. Use RNE here.
     let cb_b: [f32; 8] = std::array::from_fn(|i|
-        bf16_bits_to_f32(f32_to_bf16_bits_rtz(TURBO_C3_256[i]))
+        bf16_bits_to_f32(f32_to_bf16_bits(TURBO_C3_256[i]))
     );
 
     for tid in 0..32 {
