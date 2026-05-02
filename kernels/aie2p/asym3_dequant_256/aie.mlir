@@ -30,8 +30,12 @@ module {
         : !aie.objectfifo<memref<256xbf16>>
 
     // External C++ kernel — body lives in asym3_dequant_kernel.cc and
-    // gets linked in by aiecc when it builds the core ELF.
-    func.func private @asym3_dequant_256(memref<96xui8>, memref<1xf32>, memref<256xbf16>)
+    // gets linked in by aiecc when it builds the core ELF. Per the
+    // current MLIR-AIE convention, link_with is attached to the
+    // func.func declaration (NOT to aie.core, which is deprecated).
+    func.func private @asym3_dequant_256(memref<96xui8>, memref<1xf32>, memref<256xbf16>) attributes {
+      link_with = "asym3_dequant_kernel.o"
+    }
 
     %0 = aie.core(%core) {
       %c0 = arith.constant 0 : index
@@ -61,7 +65,7 @@ module {
         aie.objectfifo.release @bf16_out(Produce, 1)
       }
       aie.end
-    } { link_with = "asym3_dequant_kernel.o" }
+    }
 
     // Host-side DMA orchestration. Three input/output buffers sized
     // to match a single dequant call (one head, one position).
