@@ -1,5 +1,71 @@
 # Manual Review Queue (npu-roadmap/2026-05-02)
 
+## ESCALATED-4: Stage 2.6 fused score is correct but not competitive
+
+**Stage**: 2.6 (post correctness shipping)
+
+**Status**: Stage 2.6 score kernel is mathematically correct and
+end-to-end verified vs both a matching reference (NR sqrt + trig-
+eliminated reformulation) and an independent iGPU-shape reference
+(libm sqrt + atan2 + cos directly). Reformulation via cos(A-B) is
+proven valid: max rel error 3.36e-6 across 6400 element comparisons.
+
+But the perf gap is too wide to close with reasonable effort:
+
+  Measured (single-core scalar, N_ITERS=128):
+    per-iter           = 210 us / (head, pos)
+    per-dispatch       = 26.84 ms
+
+  Projection at hypothetical 16-core SIMD (16x speedup):
+    per-iter           = ~13 us
+    per-dispatch (full layer N=32768) = ~27 ms
+    per-token (46 layers) = 1.24 s
+    vs iGPU 67 ms       = 18x slower
+
+Even stacking all four optimizations (SIMD + multi-core + per-layer
+broadcast + multi-shape) projects to single-digit-x slower than
+iGPU baseline at full production shape, not faster.
+
+The 14% lift projection in `docs/plans/asym3-fused-score-plan.md`
+assumed ~322 cycles per (head, pos). Measured is closer to 330,000
+cycles per iter (1000x higher than estimate). Most of that is NOT
+transcendentals - which we already eliminated via reformulation -
+but the 128-band Givens scalar loop, ObjectFifo per-iter overhead,
+and memory access latency. The ~322 cycle estimate counted only
+arithmetic ops without memory or per-iter dispatch overhead.
+
+**Decision** (per contract escalation rule):
+
+  1. Default `HIPFIRE_NPU_DEQUANT` stays 0.
+  2. Stage 2.6 closes as ESCALATED.
+  3. The npu-roadmap reaches a conclusion: AIE-2P NPU2 is
+     fundamentally not the right tool for this triattn workload
+     given the iGPU's attention path. The chain dequant -> score
+     stays on iGPU.
+  4. The shipped kernels (asym3_dequant_layer, asym3_score_one,
+     asym3_score_layer, all multi-core variants) remain in the
+     repo as reusable scaffolding for future workloads where the
+     compute density better matches AIE-2P's strengths (e.g.
+     INT8 GEMM, FFT, unstructured matmul).
+
+**Telemetry**:
+  - bench/npu-multicore-scaling-2026-05-02.txt
+  - bench/npu-stage-1.5-scoping-2026-05-02.txt
+  - bench/stage-2.6-perf-status-2026-05-02.txt
+  - 24 commits across 21 /loop iterations on npu-roadmap/2026-05-02
+
+**Tasks**: #38 (Stage 2.6) closes as ESCALATED. #20 (Phase 4 LLM
+integration via NPU) remains in_progress as the umbrella task; can
+be marked completed once this MANUAL_REVIEW entry is acknowledged.
+
+**Future work** (out of npu-roadmap scope):
+  - Strix Halo NPU INT8 GEMM for matmul offload (different workload)
+  - HXQ/XQ4 split iGPU+NPU concurrent quant (#28)
+  - Investigate AIE-2P for prefill rather than decode (different
+    arithmetic intensity profile)
+
+
+
 ## ESCALATED-3: Stage 1.5 NPU dequant offload does not produce a lift
 
 **Stage**: 1.5 (post multi-core scaffolding)
