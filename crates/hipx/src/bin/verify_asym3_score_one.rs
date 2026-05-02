@@ -115,6 +115,61 @@ fn fast_sqrtf(x: f32) -> f32 {
     x * y
 }
 
+/// Independent iGPU-formulation reference. Uses libm sqrtf + atan2f
+/// + cosf + the original `c_mag * k_mag * cos(angle)` formula. If
+/// the kernel's trig-eliminated reformulation is wrong, this catches
+/// it (the NR-sqrt + trig-elim "matching" reference would not).
+/// Cross-checking two independent paths is what makes this verifier
+/// adversarial against silent reformulation bugs.
+#[allow(clippy::too_many_arguments)]
+fn cpu_reference_score_igpu(
+    packed: &[u8],
+    cnorm: f32,
+    centers_re: &[f32],
+    centers_im: &[f32],
+    c_abs: &[f32],
+    omega: &[f32],
+    p_q: f32,
+    cos_theta: &[f32],
+    sin_theta: &[f32],
+) -> f32 {
+    assert_eq!(packed.len(), PACKED_BYTES);
+    let mut s_trig: f32 = 0.0;
+    let mut s_norm: f32 = 0.0;
+    for tid in 0..32usize {
+        let base = tid * 3;
+        let bits = (packed[base] as u32)
+            | ((packed[base + 1] as u32) << 8)
+            | ((packed[base + 2] as u32) << 16);
+        let mut v = [0.0f32; 8];
+        for i in 0..8 {
+            let idx = ((bits >> (3 * i)) & 7) as usize;
+            v[i] = cnorm * TURBO_C3_256[idx];
+        }
+        let b0 = tid * 4;
+        for j in 0..4 {
+            let f = b0 + j;
+            let cb = cos_theta[f];
+            let sb = sin_theta[f];
+            let a_gv = v[j * 2 + 0];
+            let b_gv = v[j * 2 + 1];
+            let k_re = cb * a_gv + sb * b_gv;
+            let k_im = -sb * a_gv + cb * b_gv;
+            let k_mag = (k_re * k_re + k_im * k_im).sqrt();   // libm
+            let k_phase = k_im.atan2(k_re);                    // libm
+            let c_re = centers_re[f];
+            let c_im = centers_im[f];
+            let c_mag = (c_re * c_re + c_im * c_im).sqrt();
+            let c_phase = c_im.atan2(c_re);
+            let angle = omega[f] * p_q + c_phase - k_phase;
+            s_trig += c_mag * k_mag * angle.cos();             // libm cos
+            let r = if c_abs[f] > 1e-20 { (c_mag / c_abs[f]).min(1.0) } else { 0.0 };
+            s_norm += (1.0 - r) * c_abs[f] * k_mag;
+        }
+    }
+    s_trig + s_norm
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cpu_reference_score(
     packed: &[u8],
@@ -238,6 +293,7 @@ fn main() -> ExitCode {
 
     let mut max_rel: f64 = 0.0;
     let mut max_abs: f64 = 0.0;
+    let mut max_rel_igpu: f64 = 0.0;        // NPU vs iGPU-shape independent ref
     let mut first_fail: Option<String> = None;
     let mut bad_npu_count: usize = 0;       // NaN, +/-inf, or 0xCCCCCCCC sentinel
     let mut nondet_count: usize = 0;        // run1 != run2 within a seed
@@ -260,7 +316,11 @@ fn main() -> ExitCode {
             sin_t[f] = theta.sin();
         }
 
-        // Random centers; precompute (c_mag, c_abs, c_phase).
+        // Random centers; precompute (c_mag, c_abs, c_phase) and
+        // also track raw (c_re, c_im) for the independent iGPU-shape
+        // reference.
+        let mut c_re_arr = [0.0f32; N_BANDS];
+        let mut c_im_arr = [0.0f32; N_BANDS];
         let mut c_mag = [0.0f32; N_BANDS];
         let mut c_abs = [0.0f32; N_BANDS];
         let mut c_phase = [0.0f32; N_BANDS];
@@ -268,6 +328,8 @@ fn main() -> ExitCode {
             let c_re = (rng.unit() - 0.5) * 0.6;
             let c_im = (rng.unit() - 0.5) * 0.6;
             let c_abs_v = 0.5 + rng.unit() * 0.3;
+            c_re_arr[f] = c_re;
+            c_im_arr[f] = c_im;
             c_mag[f] = (c_re * c_re + c_im * c_im).sqrt();
             c_phase[f] = c_im.atan2(c_re);
             c_abs[f] = c_abs_v;
@@ -276,23 +338,33 @@ fn main() -> ExitCode {
         // RoPE phase per band, p_q from the seed for variety.
         let p_q = (seed % 256) as f32;
         let n_rot_bands = n_rot / 2;
+        let mut omega = [0.0f32; N_BANDS];
         let mut cos_a = [0.0f32; N_BANDS];
         let mut sin_a = [0.0f32; N_BANDS];
         for f in 0..N_BANDS {
-            let omega = if f < n_rot_bands {
+            omega[f] = if f < n_rot_bands {
                 let exponent = -2.0 * (f as f32) / (n_rot as f32);
                 (exponent * rope_theta.ln()).exp()
             } else {
                 0.0
             };
-            let angle = omega * p_q + c_phase[f];
+            let angle = omega[f] * p_q + c_phase[f];
             cos_a[f] = angle.cos();
             sin_a[f] = angle.sin();
         }
 
-        // CPU reference.
+        // Two CPU references:
+        //   cpu      = matching reference (NR sqrt + trig-eliminated)
+        //   cpu_igpu = independent iGPU-shape reference (libm sqrt +
+        //              atan2 + cos directly). Catches reformulation
+        //              bugs that matching reference would silently
+        //              share with the kernel.
         let cpu = cpu_reference_score(&packed, cnorm, &c_mag, &c_abs,
                                        &cos_a, &sin_a, &cos_t, &sin_t);
+        let cpu_igpu = cpu_reference_score_igpu(
+            &packed, cnorm, &c_re_arr, &c_im_arr, &c_abs,
+            &omega, p_q, &cos_t, &sin_t,
+        );
 
         // Pack into NPU input buffer.
         {
@@ -402,23 +474,41 @@ fn main() -> ExitCode {
         if rel > 1e-2 && first_fail.is_none() {
             first_fail = Some(format!("seed {seed}: cpu={cpu:.6e} npu={npu:.6e} rel={rel:.4e}"));
         }
+
+        // Independent iGPU-shape cross-check.
+        let abs_igpu = (cpu_igpu - npu).abs() as f64;
+        let denom_igpu = cpu_igpu.abs().max(npu.abs()).max(1e-6) as f64;
+        let rel_igpu = abs_igpu / denom_igpu;
+        if rel_igpu > max_rel_igpu { max_rel_igpu = rel_igpu; }
+        if rel_igpu > 5e-2 && first_fail.is_none() {
+            first_fail = Some(format!(
+                "seed {seed} iGPU-ref: cpu_igpu={cpu_igpu:.6e} npu={npu:.6e} rel_igpu={rel_igpu:.4e}"
+            ));
+        }
     }
 
     println!();
     println!("=== verify_asym3_score_one ({n_seeds} seeds) ===");
-    println!("  determinism:  {} ({} non-deterministic seeds)",
+    println!("  determinism:    {} ({} non-deterministic seeds)",
              if nondet_count == 0 { "PASS" } else { "FAIL" }, nondet_count);
-    println!("  bad outputs:  {} (NaN, inf, or 0xCCCCCCCC sentinel)", bad_npu_count);
-    println!("  max |Δ|  = {max_abs:.4e}");
-    println!("  max rel  = {max_rel:.4e}");
+    println!("  bad outputs:    {} (NaN, inf, or 0xCCCCCCCC sentinel)", bad_npu_count);
+    println!("  max |Δ| (matching ref):       {max_abs:.4e}");
+    println!("  max rel (matching ref, NR):   {max_rel:.4e}  (bound 1e-2)");
+    println!("  max rel (iGPU-shape, libm):   {max_rel_igpu:.4e}  (bound 5e-2)");
     if let Some(fail) = &first_fail { eprintln!("  first failure: {fail}"); }
 
-    // Tolerance: 1% relative is a lot but the score is a sum-product
-    // of 128 bands so accumulated NR sqrt + reordering noise can hit
-    // this. Tighter bound after the SIMD-optimized kernel lands.
+    // Tolerance:
+    //   matching ref:   1e-2 (NR sqrt + reformulation, same math
+    //                   as the kernel; near-zero error expected)
+    //   iGPU-shape ref: 5e-2 (libm sqrt + atan2 + cos directly,
+    //                   captures the absolute correctness of the
+    //                   reformulation; NR sqrt error of 5e-4 per
+    //                   band x 128 bands sums to bounded relative
+    //                   error)
     let pass = nondet_count == 0
         && bad_npu_count == 0
-        && max_rel <= 1e-2;
+        && max_rel <= 1e-2
+        && max_rel_igpu <= 5e-2;
     if !pass {
         eprintln!("\n=== STAGE 2.6 SCORE VERIFY: FAIL ===");
         ExitCode::FAILURE
