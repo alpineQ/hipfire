@@ -157,6 +157,57 @@ impl Bo {
         })
     }
 
+    /// Wrap a DRM PRIME-imported dmabuf (e.g. from an amdgpu / HSA
+    /// allocation) as a hipx Bo. The returned Bo owns the imported
+    /// handle and will GEM_CLOSE it on drop; the dmabuf fd ownership
+    /// is the caller's. Caller passes `size` because dmabuf metadata
+    /// alone can over-allocate (page-rounded) on the source side and
+    /// we want the BO size that mmap operations care about.
+    ///
+    /// On Strix Halo the imported BO has `xdna_addr = AMDXDNA_INVALID_ADDR`
+    /// (no NPU device VA — the BO rides PASID/IOMMU translation just
+    /// like a SHMEM BO). The cmd packet should pass the CPU virtual
+    /// address from `host_ptr()`. **`sync(SYNC_TO_DEVICE)` MUST be
+    /// called before the first EXEC_CMD that reads from this BO** —
+    /// imported pages aren't enrolled in the NPU's IOMMU domain
+    /// otherwise. Empirically this manifests as the kernel reading
+    /// zeros from the input.
+    pub fn from_imported_dmabuf(fd: i32, dmabuf_fd: i32, size: usize) -> Result<Self> {
+        let handle = crate::prime::import_fd_to_handle(fd, dmabuf_fd)?;
+        let mut info = DrmGetBoInfo {
+            handle,
+            ..Default::default()
+        };
+        let ret = unsafe {
+            libc::ioctl(
+                fd,
+                drm_ioctl_amdxdna_get_bo_info(),
+                &mut info as *mut _ as *mut libc::c_void,
+            )
+        };
+        if ret != 0 {
+            let errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(0);
+            let _ = close_handle(fd, handle);
+            return Err(XdnaError {
+                code: errno,
+                message: format!(
+                    "GET_BO_INFO(imported handle={handle}) failed (errno={errno})"
+                ),
+            });
+        }
+        Ok(Self {
+            fd,
+            handle,
+            size,
+            xdna_addr: info.xdna_addr,
+            map_offset: info.map_offset,
+            mapping: None,
+            is_dev_heap: false,
+        })
+    }
+
     /// mmap the BO into the process address space. Idempotent.
     ///
     /// DEV_HEAP requires a specific dance to satisfy the AIE-2P

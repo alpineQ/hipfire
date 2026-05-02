@@ -22,15 +22,11 @@ use hipx::cmd::config_cus;
 use hipx::ert::ErtBuilder;
 use hipx::fence::timeline_wait;
 use hipx::hwctx::HwctxBuilder;
-use hipx::ioctl::{
-    drm_ioctl_amdxdna_get_bo_info, drm_ioctl_amdxdna_sync_bo, DrmGetBoInfo, DrmSyncBo,
-    SYNC_FROM_DEVICE, SYNC_TO_DEVICE,
-};
+use hipx::ioctl::{SYNC_FROM_DEVICE, SYNC_TO_DEVICE};
 use hipx::kernels::{
     vec_scalar_mul_args as args, VEC_SCALAR_MUL_COLUMNS, VEC_SCALAR_MUL_INSTS,
     VEC_SCALAR_MUL_OPS_PER_CYCLE, VEC_SCALAR_MUL_PDI,
 };
-use hipx::prime::import_fd_to_handle;
 use hipx::Hipx;
 
 const N_ELEMS: usize = 4096;
@@ -81,53 +77,24 @@ fn main() -> ExitCode {
         agpu_input[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
     }
 
-    // Import the dmabuf into amdxdna and get an mmap'd CPU view of the
-    // *same* physical pages. We need a CPU VA that's valid in this
-    // process (it is: amdgpu_ptr is process-local already), but going
-    // through the amdxdna fd's mapping ensures the kernel records the
-    // PASID enrollment for this BO from the NPU side too.
-    let npu_handle = match import_fd_to_handle(hipx.device.fd, dmabuf_fd) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("PRIME_FD_TO_HANDLE: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let mut info = DrmGetBoInfo {
-        handle: npu_handle,
-        ..Default::default()
-    };
-    let ret = unsafe {
-        libc::ioctl(
-            hipx.device.fd,
-            drm_ioctl_amdxdna_get_bo_info(),
-            &mut info as *mut _ as *mut libc::c_void,
-        )
-    };
-    if ret != 0 {
-        eprintln!("GET_BO_INFO on imported handle failed: errno={}",
-                  std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
-        return ExitCode::FAILURE;
-    }
-    let npu_input_ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            INPUT_BYTES,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            hipx.device.fd,
-            info.map_offset as libc::off_t,
-        )
-    };
-    if npu_input_ptr == libc::MAP_FAILED {
-        eprintln!("mmap NPU side at imported map_offset: {}",
-                  std::io::Error::last_os_error());
-        return ExitCode::FAILURE;
-    }
-    let input_va_npu = npu_input_ptr as u64;
+    // Import the dmabuf into amdxdna using the first-class wrapper.
+    // Bo::from_imported_dmabuf does PRIME_FD_TO_HANDLE + GET_BO_INFO;
+    // .map() does the amdxdna-side mmap. Drop closes the handle.
+    let mut input_bo =
+        hipx::Bo::from_imported_dmabuf(hipx.device.fd, dmabuf_fd, INPUT_BYTES)
+            .unwrap_or_else(|e| {
+                eprintln!("Bo::from_imported_dmabuf: {e}");
+                std::process::exit(1);
+            });
+    let _ = input_bo.map().unwrap_or_else(|e| {
+        eprintln!("input_bo.map: {e}");
+        std::process::exit(1);
+    });
+    let input_va_npu = input_bo.host_ptr().unwrap() as u64;
     println!(
         "[dbc] amdgpu GTT input: handle={agpu_handle} cpu_va={agpu_ptr:?}; \
-         dmabuf imported on NPU: handle={npu_handle} cpu_va={npu_input_ptr:?}"
+         dmabuf imported on NPU: handle={} cpu_va={input_va_npu:#x}",
+        input_bo.handle
     );
 
     // 2. Standard hwctx + PDI + instr + scale + output + placeholder BOs
@@ -221,51 +188,16 @@ fn main() -> ExitCode {
         let _ = eb.finalize(0x3C);
     }
 
-    // We need an `&Bo` for the EXEC_CMD args list, but the imported BO
-    // isn't a hipx::Bo (it has no Drop semantics tied to amdxdna's
-    // CREATE_BO path). Build a minimal proxy: a struct with the right
-    // shape — but the cleaner path is to just wrap the imported handle
-    // in something that implements the .handle field that submit_exec_cmd
-    // reads. For this PoC we'll inline the EXEC_CMD here.
-    //
-    // (Alternative is to add an `import_dmabuf_as_bo` helper to the Bo
-    // type. We'll do that once dmabuf-as-arg is proven to work.)
+    // The imported BO is now a hipx::Bo, so it goes through the
+    // standard submit_exec_cmd path. Drop semantics: Bo::Drop does
+    // GEM_CLOSE on the imported handle.
 
-    use hipx::ioctl::{drm_ioctl_amdxdna_exec_cmd, DrmExecCmd, CMD_SUBMIT_EXEC_BUF};
-    let cmd_handles = vec![cmd_bo.handle];
-    let arg_handles = vec![
-        instr_bo.handle,
-        npu_handle, // ← imported dmabuf BO handle
-        scale_bo.handle,
-        output_bo.handle,
-        bo3_bo.handle,
-        bo4_bo.handle,
-    ];
-
-    // Helper: SYNC_BO on the dmabuf-imported handle. Existing
-    // hipx::Bo::sync requires a hipx::Bo; we do it inline here.
-    let sync_imported = |dir: u32| -> i32 {
-        let mut req = DrmSyncBo {
-            handle: npu_handle,
-            direction: dir,
-            offset: 0,
-            size: INPUT_BYTES as u64,
-        };
-        unsafe {
-            libc::ioctl(
-                hipx.device.fd,
-                drm_ioctl_amdxdna_sync_bo(),
-                &mut req as *mut _ as *mut libc::c_void,
-            )
-        }
-    };
-
-    // Test which input-VA flavour the firmware accepts. Run all
-    // iterations with each, report.
+    // Test which input-VA flavour the firmware accepts. Both should
+    // work (same physical pages); kept as a regression check.
     let amdgpu_va = agpu_ptr as u64;
     let npu_va = input_va_npu;
 
-    println!("[dbc] testing two input-VA candidates and SYNC_BO variations...");
+    println!("[dbc] testing both VA flavours through Bo wrapper...");
 
     let mut total_pass = 0;
     let mut total_fail = 0;
@@ -296,7 +228,13 @@ fn main() -> ExitCode {
             let v = (i & 0xFF) as i16;
             agpu_input[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
         }
-        let sync_ret = sync_imported(SYNC_TO_DEVICE);
+        let sync_ret = match input_bo.sync(SYNC_TO_DEVICE) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("input_bo.sync failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
 
         {
             let buf = output_bo.map().expect("output reset");
@@ -311,35 +249,18 @@ fn main() -> ExitCode {
         }
         let _ = cmd_bo.sync(SYNC_TO_DEVICE);
 
-        let cmd_handles_field: u64 = cmd_handles[0] as u64;
-        let args_field: u64 = arg_handles.as_ptr() as u64;
-        let mut req = DrmExecCmd {
-            ext: 0,
-            ext_flags: 0,
-            hwctx: ctx.handle,
-            ty: CMD_SUBMIT_EXEC_BUF,
-            cmd_handles: cmd_handles_field,
-            args: args_field,
-            cmd_count: cmd_handles.len() as u32,
-            arg_count: arg_handles.len() as u32,
-            seq: 0,
+        let seq = match hipx::cmd::submit_exec_cmd(
+            hipx.device.fd,
+            &ctx,
+            &[&cmd_bo],
+            &[&instr_bo, &input_bo, &scale_bo, &output_bo, &bo3_bo, &bo4_bo],
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("iter {iter} submit: {e}");
+                return ExitCode::FAILURE;
+            }
         };
-        let ret = unsafe {
-            libc::ioctl(
-                hipx.device.fd,
-                drm_ioctl_amdxdna_exec_cmd(),
-                &mut req as *mut _ as *mut libc::c_void,
-            )
-        };
-        if ret != 0 {
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            eprintln!(
-                "iter {iter} EXEC_CMD failed errno={errno} ({})",
-                std::io::Error::from_raw_os_error(errno)
-            );
-            return ExitCode::FAILURE;
-        }
-        let seq = req.seq;
         if let Err(e) = timeline_wait(
             hipx.device.fd,
             ctx.syncobj_handle,
@@ -375,9 +296,10 @@ fn main() -> ExitCode {
         }
     }
 
-    // Cleanup
+    // Cleanup. input_bo's Drop closes the imported handle and munmaps
+    // its amdxdna-side mapping. Manually unmap + close the amdgpu side.
+    drop(input_bo);
     unsafe {
-        libc::munmap(npu_input_ptr, INPUT_BYTES);
         libc::munmap(agpu_ptr as *mut libc::c_void, INPUT_BYTES);
     }
     let _ = agpu::gem_close(agpu_fd, agpu_handle);
