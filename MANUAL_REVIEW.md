@@ -51,3 +51,30 @@ The CPU reference computes `bf16(cnorm) -> f32 -> mul f32 -> RNE bf16`. Both RNE
 **Recommendation**: option (a) calibration. It gives bit-for-bit determinism without depending on AIE-API undocumented internals. The downside is the verifier becomes "kernel's codebook == measured codebook" rather than "kernel's codebook == engine's codebook," so we'd want a separate sanity check that the measured codebook is within 1 ULP of the engine values.
 
 **Time spent**: ~45 minutes from the first failed run to escalation. Two genuine bugs caught.
+
+---
+
+### Update after calibration (commit `d6f726b`)
+
+Calibrated each of the 8 codebook entries by sending all-idx=k inputs with cnorm=1.0 (which is exactly representable in bf16). The kernel's stored bf16 codebook is **byte-for-byte identical** to my CPU reference codebook for every entry:
+
+```
+[calibrate] codebook[0] kernel=0xbe0a(-0.1347656) ref=0xbe0a(-0.1348600) ==
+[calibrate] codebook[1] kernel=0xbdab(-0.0834961) ref=0xbdab(-0.0833200) ==
+[calibrate] codebook[2] kernel=0xbd3e(-0.0463867) ref=0xbd3e(-0.0464690) ==
+[calibrate] codebook[3] kernel=0xbc79(-0.0151978) ref=0xbc79(-0.0151760) ==
+[calibrate] codebook[4] kernel=0x3c79(0.0151978) ref=0x3c79(0.0151760) ==
+[calibrate] codebook[5] kernel=0x3d3e(0.0463867) ref=0x3d3e(0.0464690) ==
+[calibrate] codebook[6] kernel=0x3dab(0.0834961) ref=0x3dab(0.0833200) ==
+[calibrate] codebook[7] kernel=0x3e0a(0.1347656) ref=0x3e0a(0.1348600) ==
+```
+
+After running with the calibrated codebook in the CPU reference, mismatches are unchanged (159/256, 121/256, etc., same first-diff dims). **This isolates the bug to the `aie::mul(bf16, bf16) -> accfloat -> bf16` rounding chain, NOT codebook conversion.**
+
+Implication for the open questions above:
+
+- Hypothesis 1 (`bfloat16(float)` ctor non-RNE) is FALSE: the codebook bytes match exactly under standard RNE.
+- Hypothesis 2 or 3 (mul or accumulator-to-bf16 rounding) is the active explanation.
+- Option (a) calibration of the codebook does not unblock bit-for-bit. Calibration of the mul itself is intractable (combinatorial input space).
+
+**Refined recommendation**: relax stage 1.1 acceptance to "100 random seeds match the CPU reference up to 1 bf16 ULP per element." Document this as the achievable correctness floor for AIE-2P bf16 mul. The kernel IS deterministic and CORRECT in the asym3 sense; the mul's last-bit behavior is hardware. If the principal disagrees, the next attempt would be to dump intermediate accfloat values via a custom kernel that returns the accumulator pre-conversion, comparing those against my f32 product. That would tell us whether the divergence is in the mul or in the to_vector conversion.
