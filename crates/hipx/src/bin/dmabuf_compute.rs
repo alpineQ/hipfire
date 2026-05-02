@@ -22,7 +22,10 @@ use hipx::cmd::config_cus;
 use hipx::ert::ErtBuilder;
 use hipx::fence::timeline_wait;
 use hipx::hwctx::HwctxBuilder;
-use hipx::ioctl::{drm_ioctl_amdxdna_get_bo_info, DrmGetBoInfo, SYNC_FROM_DEVICE, SYNC_TO_DEVICE};
+use hipx::ioctl::{
+    drm_ioctl_amdxdna_get_bo_info, drm_ioctl_amdxdna_sync_bo, DrmGetBoInfo, DrmSyncBo,
+    SYNC_FROM_DEVICE, SYNC_TO_DEVICE,
+};
 use hipx::kernels::{
     vec_scalar_mul_args as args, VEC_SCALAR_MUL_COLUMNS, VEC_SCALAR_MUL_INSTS,
     VEC_SCALAR_MUL_OPS_PER_CYCLE, VEC_SCALAR_MUL_PDI,
@@ -239,9 +242,62 @@ fn main() -> ExitCode {
         bo4_bo.handle,
     ];
 
+    // Helper: SYNC_BO on the dmabuf-imported handle. Existing
+    // hipx::Bo::sync requires a hipx::Bo; we do it inline here.
+    let sync_imported = |dir: u32| -> i32 {
+        let mut req = DrmSyncBo {
+            handle: npu_handle,
+            direction: dir,
+            offset: 0,
+            size: INPUT_BYTES as u64,
+        };
+        unsafe {
+            libc::ioctl(
+                hipx.device.fd,
+                drm_ioctl_amdxdna_sync_bo(),
+                &mut req as *mut _ as *mut libc::c_void,
+            )
+        }
+    };
+
+    // Test which input-VA flavour the firmware accepts. Run all
+    // iterations with each, report.
+    let amdgpu_va = agpu_ptr as u64;
+    let npu_va = input_va_npu;
+
+    println!("[dbc] testing two input-VA candidates and SYNC_BO variations...");
+
     let mut total_pass = 0;
     let mut total_fail = 0;
     for iter in 0..10 {
+        // Variation: even iters use amdgpu CPU VA, odd use amdxdna mmap VA.
+        // First pass also tests SYNC_BO TO_DEVICE on the imported handle.
+        let use_amdgpu_va = iter % 2 == 0;
+        let chosen_va = if use_amdgpu_va { amdgpu_va } else { npu_va };
+        // Re-pack the cmd packet's INPUT field for this iteration.
+        {
+            let cbuf = cmd_bo.map().expect("cmd remap");
+            let mut eb = ErtBuilder::new_start_cu(&mut cbuf[..256]);
+            eb.set_cu_mask(0x1);
+            eb.set_arg_u64(args::OPCODE, 3);
+            eb.set_arg_u64(args::INSTR_PTR, instr_bo.xdna_addr);
+            eb.set_arg_u32(args::NINSTR, ninstr_dwords);
+            eb.set_arg_u64(args::INPUT, chosen_va);
+            eb.set_arg_u64(args::SCALE, scale_va);
+            eb.set_arg_u64(args::OUTPUT, output_va);
+            eb.set_arg_u64(args::BO3, bo3_va);
+            eb.set_arg_u64(args::BO4, bo4_va);
+            let _ = eb.finalize(0x3C);
+        }
+
+        // Re-write the input pattern via amdgpu mapping every iter so
+        // we know it's fresh.
+        for i in 0..N_ELEMS {
+            let v = (i & 0xFF) as i16;
+            agpu_input[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+        }
+        let sync_ret = sync_imported(SYNC_TO_DEVICE);
+
         {
             let buf = output_bo.map().expect("output reset");
             for b in buf[..OUTPUT_BYTES].iter_mut() {
@@ -305,15 +361,16 @@ fn main() -> ExitCode {
                 errors += 1;
             }
         }
+        let va_label = if use_amdgpu_va { "amdgpu_va" } else { "npu_va" };
         if errors == 0 {
             total_pass += 1;
-            if iter < 3 {
-                println!("[dbc] iter {iter} seq={seq} PASS");
-            }
+            println!(
+                "[dbc] iter {iter} seq={seq} PASS  ({va_label}, sync_ret={sync_ret})"
+            );
         } else {
             total_fail += 1;
             println!(
-                "[dbc] iter {iter} seq={seq} FAIL ({errors}/{N_ELEMS} mismatches)"
+                "[dbc] iter {iter} seq={seq} FAIL  ({va_label}, sync_ret={sync_ret}, {errors}/{N_ELEMS} mismatches)"
             );
         }
     }
