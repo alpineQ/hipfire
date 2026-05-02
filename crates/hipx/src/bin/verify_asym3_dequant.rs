@@ -511,26 +511,144 @@ fn calibrate_codebook(
         let lo = outp[0] as u16;
         let hi = outp[1] as u16;
         cb[k as usize] = lo | (hi << 8);
-        // Sanity: every dim should match (all idx=k everywhere).
+        // HARD: every dim must match dim 0 (all-same-idx pattern -> all-same-output).
         for d in 1..HEAD_DIM {
             let l = outp[d * 2] as u16;
             let h = outp[d * 2 + 1] as u16;
             let bits = l | (h << 8);
             if bits != cb[k as usize] {
-                eprintln!(
-                    "[calibrate] WARN k={k} dim {d} differs from dim 0: 0x{bits:04x} vs 0x{:04x}",
+                return Err(format!(
+                    "calibrate FAIL: k={k} dim {d} = 0x{bits:04x} but dim 0 = 0x{:04x} \
+                     (uniform-pattern test broke; kernel unpack or dispatch is bugged)",
                     cb[k as usize]
-                );
+                ).into());
             }
         }
-        let f = bf16_bits_to_f32(cb[k as usize]);
+        // HARD: kernel codebook entry must match engine TURBO_C3_256 within
+        // bf16 RTZ/RNE rounding (which agree on every TURBO_C3_256 value).
         let expected = TURBO_C3_256[k as usize];
-        let exp_bf16 = f32_to_bf16_bits(expected);
-        let mark = if cb[k as usize] == exp_bf16 { "==" } else { "!!" };
-        println!("[calibrate] codebook[{k}] kernel=0x{:04x}({:.7}) ref=0x{:04x}({:.7}) {mark}",
-                 cb[k as usize], f, exp_bf16, expected);
+        let exp_rne = f32_to_bf16_bits(expected);
+        let exp_rtz = f32_to_bf16_bits_rtz(expected);
+        let exp_raz = f32_to_bf16_bits_raz(expected);
+        let observed = cb[k as usize];
+        let agrees = observed == exp_rne || observed == exp_rtz || observed == exp_raz;
+        let mark = if agrees { "==" } else { "!!" };
+        let f = bf16_bits_to_f32(observed);
+        println!("[calibrate] codebook[{k}] kernel=0x{:04x}({:.7}) ref(RNE)=0x{:04x}({:.7}) {mark}",
+                 observed, f, exp_rne, expected);
+        if !agrees {
+            return Err(format!(
+                "calibrate FAIL: codebook[{k}] kernel=0x{observed:04x} \
+                 ref RNE/RTZ/RAZ all disagree (RNE=0x{exp_rne:04x} RTZ=0x{exp_rtz:04x} \
+                 RAZ=0x{exp_raz:04x}). Engine codebook is the source of truth; \
+                 kernel codebook is wrong."
+            ).into());
+        }
     }
     Ok(cb)
+}
+
+/// Stronger: pack 32 threads each with a different idx pattern so a
+/// permutation bug in the unpack would show up as crossed dims.
+/// Pattern: thread tid encodes 8 indices = (tid % 8) repeated. Then
+/// dims tid*8 .. tid*8+7 should all be cnorm * codebook[tid % 8].
+/// The expected output is computable from the engine codebook
+/// directly (no calibration loop), so a bug that permutes idx values
+/// between threads or scrambles the codebook lookup is caught here.
+fn calibrate_varied_idx(
+    hipx_dev: &Hipx,
+    ctx: &hipx::hwctx::Hwctx,
+    instr_bo: &hipx::Bo,
+    insts_len: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cnorm = 1.0f32;
+    // Thread tid encodes 8 copies of (tid % 8) in its 24-bit word.
+    let mut packed = vec![0u8; PACKED_BYTES];
+    for tid in 0..32usize {
+        let k = (tid % 8) as u32;
+        let mut word: u32 = 0;
+        for i in 0..8 { word |= k << (i * 3); }
+        let base = tid * 3;
+        packed[base] = (word & 0xff) as u8;
+        packed[base + 1] = ((word >> 8) & 0xff) as u8;
+        packed[base + 2] = ((word >> 16) & 0xff) as u8;
+    }
+
+    // Dispatch.
+    let mut packed_bo = hipx_dev.alloc_shmem(PACKED_BYTES)?;
+    { let buf = packed_bo.map()?; buf[..PACKED_BYTES].copy_from_slice(&packed); }
+    let _ = packed_bo.sync(SYNC_TO_DEVICE);
+    let packed_va = packed_bo.host_ptr().unwrap() as u64;
+
+    let mut cnorm_bo = hipx_dev.alloc_shmem(CNORM_BYTES)?;
+    { let buf = cnorm_bo.map()?; buf[..4].copy_from_slice(&cnorm.to_le_bytes()); }
+    let _ = cnorm_bo.sync(SYNC_TO_DEVICE);
+    let cnorm_va = cnorm_bo.host_ptr().unwrap() as u64;
+
+    let mut out_bo = hipx_dev.alloc_shmem(OUT_BYTES)?;
+    { let buf = out_bo.map()?; for b in buf[..OUT_BYTES].iter_mut() { *b = 0xCC; } }
+    let _ = out_bo.sync(SYNC_TO_DEVICE);
+    let out_va = out_bo.host_ptr().unwrap() as u64;
+
+    let mut bo3 = hipx::Bo::alloc_shmem_exact(hipx_dev.device.fd, 8)?;
+    { let buf = bo3.map()?; for b in buf.iter_mut() { *b = 0; } }
+    let _ = bo3.sync(SYNC_TO_DEVICE);
+    let bo3_va = bo3.host_ptr().unwrap() as u64;
+    let mut bo4 = hipx::Bo::alloc_shmem_exact(hipx_dev.device.fd, 1)?;
+    { let buf = bo4.map()?; for b in buf.iter_mut() { *b = 0; } }
+    let _ = bo4.sync(SYNC_TO_DEVICE);
+    let bo4_va = bo4.host_ptr().unwrap() as u64;
+
+    let mut cmd_bo = hipx_dev.alloc_cmd(4096)?;
+    let ninstr_dwords = (insts_len / 4) as u32;
+    {
+        let cbuf = cmd_bo.map()?;
+        let mut eb = ErtBuilder::new_start_cu(&mut cbuf[..256]);
+        use hipx::kernels::passthrough_4k_args as args;
+        eb.set_cu_mask(0x1);
+        eb.set_arg_u64(args::OPCODE, 3);
+        eb.set_arg_u64(args::INSTR_PTR, instr_bo.xdna_addr);
+        eb.set_arg_u32(args::NINSTR, ninstr_dwords);
+        eb.set_arg_u64(args::BO0, packed_va);
+        eb.set_arg_u64(args::BO1, cnorm_va);
+        eb.set_arg_u64(args::BO2, out_va);
+        eb.set_arg_u64(args::BO3, bo3_va);
+        eb.set_arg_u64(args::BO4, bo4_va);
+        let _ = eb.finalize(0x3C);
+    }
+    let _ = cmd_bo.sync(SYNC_TO_DEVICE);
+
+    let seq = submit_exec_cmd(hipx_dev.device.fd, ctx,
+        &[&cmd_bo], &[instr_bo, &packed_bo, &cnorm_bo, &out_bo, &bo3, &bo4])?;
+    timeline_wait(hipx_dev.device.fd, ctx.syncobj_handle, seq, Duration::from_secs(5))?;
+    let _ = out_bo.sync(SYNC_FROM_DEVICE);
+
+    // Each thread tid produced 8 outputs at dims tid*8 .. tid*8+7.
+    // All 8 should equal cnorm_bf16 * codebook_bf16[(tid % 8)].
+    // For cnorm = 1.0 (bf16-exact), expected = codebook_bf16[(tid % 8)].
+    let outp = out_bo.map()?;
+    let mut max_ulp_per_thread: u32 = 0;
+    for tid in 0..32usize {
+        let k = tid % 8;
+        let expected_bf16 = f32_to_bf16_bits_rtz(TURBO_C3_256[k]);
+        for i in 0..8 {
+            let d = tid * 8 + i;
+            let lo = outp[d * 2] as u16;
+            let hi = outp[d * 2 + 1] as u16;
+            let observed = lo | (hi << 8);
+            let u = ulp_distance(observed, expected_bf16);
+            if u > max_ulp_per_thread { max_ulp_per_thread = u; }
+            if u > 2 {
+                return Err(format!(
+                    "varied-idx FAIL: dim {d} tid {tid} k {k} expected 0x{expected_bf16:04x} \
+                     observed 0x{observed:04x} (ulp {u} > 2). Per-thread idx mapping is wrong."
+                ).into());
+            }
+        }
+    }
+    println!("[calibrate-varied] 32 threads x 8 dims, k = tid%8, max_ulp = {} (bound 2)",
+             max_ulp_per_thread);
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -582,21 +700,43 @@ fn main() -> ExitCode {
     }
     let _ = instr_bo.sync(SYNC_TO_DEVICE);
 
-    // Calibrate kernel codebook by sending all-idx=k inputs with cnorm=1.0.
-    // Disable with ASYM3_NO_CALIBRATE=1 to compare against the engine codebook
-    // directly (the original strict mode that also catches bf16-rounding diffs).
-    let calibrated_cb = if std::env::var("ASYM3_NO_CALIBRATE").is_err() {
+    // Calibration phase as VALIDATION (not as the source of the CPU
+    // reference). Runs two probes that catch self-consistent kernel
+    // bugs which a "kernel-vs-self-derived-codebook" verifier would
+    // miss:
+    //
+    //   (a) calibrate_codebook: all-same-idx patterns, observe dim 0,
+    //       compare against the ENGINE codebook (the source of truth).
+    //       Hard-fails if any kernel codebook entry diverges from the
+    //       engine value beyond bf16 RTZ/RNE/RAZ tolerance.
+    //   (b) calibrate_varied_idx: thread tid encodes idx = tid % 8
+    //       (different threads, different idx). Cross-thread output
+    //       mapping is verified against the engine codebook directly.
+    //       Hard-fails if any thread's output is > 2 ULP from
+    //       expected. Catches per-thread permutation bugs that the
+    //       all-same pattern cannot detect.
+    //
+    // The CPU reference for the random-seed phase always uses the
+    // ENGINE codebook (`cpu_reference`), never the calibrated codebook
+    // observed from the kernel itself. This avoids the "self-consistent
+    // wrong kernel" trap (codex review caught the original calibration
+    // path).
+    if std::env::var("ASYM3_NO_CALIBRATE").is_err() {
         match calibrate_codebook(&hipx_dev, &ctx, &instr_bo, insts.len()) {
-            Ok(cb) => {
-                println!();
-                Some(cb)
-            }
+            Ok(_) => {}
             Err(e) => {
                 eprintln!("calibration failed: {e}");
                 return ExitCode::FAILURE;
             }
         }
-    } else { None };
+        match calibrate_varied_idx(&hipx_dev, &ctx, &instr_bo, insts.len()) {
+            Ok(()) => println!(),
+            Err(e) => {
+                eprintln!("varied-idx calibration failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     // Stage 1.1 acceptance gates (per docs/plans/aie2p-bf16-mul-shape.md):
     //
@@ -625,8 +765,11 @@ fn main() -> ExitCode {
 
     for s in 0..n_seeds {
         let seed = 0x1000_0001u64.wrapping_add(s as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        // CPU reference uses the engine codebook directly (not the
+        // calibrated codebook). See comment above on the
+        // "self-consistent wrong kernel" trap.
         match run_one_seed(seed, &hipx_dev, &ctx, &instr_bo, pdi.len(), insts.len(),
-                           calibrated_cb.as_ref()) {
+                           None) {
             Ok(r) => {
                 if !r.determ_ok {
                     all_determ = false;
