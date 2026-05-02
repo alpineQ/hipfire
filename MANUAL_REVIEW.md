@@ -78,3 +78,76 @@ Implication for the open questions above:
 - Option (a) calibration of the codebook does not unblock bit-for-bit. Calibration of the mul itself is intractable (combinatorial input space).
 
 **Refined recommendation**: relax stage 1.1 acceptance to "100 random seeds match the CPU reference up to 1 bf16 ULP per element." Document this as the achievable correctness floor for AIE-2P bf16 mul. The kernel IS deterministic and CORRECT in the asym3 sense; the mul's last-bit behavior is hardware. If the principal disagrees, the next attempt would be to dump intermediate accfloat values via a custom kernel that returns the accumulator pre-conversion, comparing those against my f32 product. That would tell us whether the divergence is in the mul or in the to_vector conversion.
+
+---
+
+### Update after f32 diagnostic kernel + sweep + manual case analysis (commit df36d8a)
+
+Built `kernels/aie2p/asym3_dequant_256_f32` that returns the
+`aie::mul` accumulator as fp32 instead of rounding to bf16. Swept 14336
+(cnorm bf16 x cb_idx) pairs through it. Result: ratio between CPU
+fp32-faithful product and NPU f32 acc = **1.0000000000 across all
+14336 pairs**. The mul is bit-faithful when output is fp32.
+
+This isolates the discrepancy to the bf16 down-conversion path:
+`accum.to_vector<bfloat16>()`. Tested three cases manually with bf16-
+exact cnorm (eliminating cnorm conversion as a variable):
+
+```
+Case A: cnorm 0x3EC8 (0.39), cb 0x3E0A. f32 product = 0x3D57A000
+        RAZ predicts 0x3D58; NPU produces 0x3D56  (2 ULPs LESS magnitude)
+
+Case B: cnorm 0xBFF5 (-1.91), cb 0x3D3E. f32 product = 0xBDB5D600
+        RAZ predicts 0xBDB6; NPU produces 0xBDB7  (1 ULP MORE magnitude)
+
+Case C: cnorm 0xBF70 (-0.94), cb 0x3DAB. f32 product = 0xBDA05000
+        RAZ predicts 0xBDA1; NPU produces 0xBDA1  (matches RAZ)
+```
+
+**Mixed directions**. No single-mode rounding (RNE / RTZ / RAZ /
+RAZ+1mag / etc.) fits all three. The bf16 down-conversion's
+behavior depends on bits beyond what a simple rounding rule captures.
+Hypotheses:
+
+1. AIE-2P's `accfloat -> bfloat16` is a hardware instruction with
+   non-IEEE rounding (saturating, or magnitude-aware bias). Not
+   documented publicly.
+2. `accum::to_vector<bfloat16>` for the bf16 path uses a different
+   precision than `to_vector<float>` reports. The "f32 acc" we
+   observe via `to_vector<float>` may itself be a rounded view of a
+   wider internal accumulator, while `to_vector<bfloat16>` uses the
+   full accumulator. (Plausible but the sweep showed `to_vector<float>`
+   is bit-faithful w.r.t. the CPU fp32 product, suggesting accfloat
+   IS f32-precision-equivalent on bf16 inputs. Unclear.)
+
+Reverse-engineering this rigorously is open-ended.
+
+**Tractable bit-exact path**: ditch closed-form modeling. Build a
+LUT-based reference. Sweep all 65536 cnorm bf16 values x 8 codebook
+indices through the bf16 kernel directly. ~524k dispatches at
+~250 us each = ~131 s for the full sweep. Resulting LUT is 1 MB
+(524k * 2 bytes). For verification, look up `(cnorm_bf16, cb_idx)`
+in the LUT. Bit-exact by construction.
+
+For the f32 -> bf16 cnorm conversion question, we need either:
+(a) characterize the kernel's `(bfloat16)(*float_ptr)` rounding
+    via a separate calibration sweep across f32 inputs of varying
+    low-bit patterns, OR
+(b) change the kernel's interface to take bf16 cnorm directly,
+    move the f32 -> bf16 conversion to host-side IEEE RNE.
+    Production engine integration would do this anyway since
+    cnorm is computed once per layer per token, so paying the
+    host-side conversion cost is fine.
+
+Option (b) is structurally cleaner: kernel only handles bf16
+operations, all f32 -> bf16 conversion happens host-side under
+known IEEE rules. CPU reference becomes deterministic for any
+input.
+
+**Recommendation post-refinement**: option (b). Modify the kernel
+to take bf16 cnorm. Build the LUT for bf16 inputs. Use the LUT in
+the verifier. Bit-exact stage 1.1 by construction.
+
+Estimated work: kernel mod + rebuild (~30 min), LUT generation
+sweep (~3 min runtime + plumbing 30 min), verifier rewrite to
+LUT-based (~30 min). Total ~1.5h for clean stage 1.1 win.
