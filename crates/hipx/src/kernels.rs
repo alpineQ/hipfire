@@ -307,7 +307,11 @@ pub const ASYM3_DEQUANT_LAYER_PDI: &[u8] =
 pub const ASYM3_DEQUANT_LAYER_INSTS: &[u8] =
     include_bytes!("../../../kernels/aie2p/asym3_dequant_layer/build/insts.bin");
 
-pub const ASYM3_DEQUANT_LAYER_KERNEL_ID: u32 = 0x902;
+// aiecc emits 0x901 by default for any single-kernel xclbin in this
+// codebase (see build/aie.mlir.prj/main_kernels.json's dpu_kernel_id).
+// Each kernel is loaded into its own hwctx via its own PDI, so the
+// ID does not clash across kernels at runtime.
+pub const ASYM3_DEQUANT_LAYER_KERNEL_ID: u32 = 0x901;
 pub const ASYM3_DEQUANT_LAYER_OPS_PER_CYCLE: u32 = 2048;
 pub const ASYM3_DEQUANT_LAYER_COLUMNS: u32 = 8;
 pub const ASYM3_DEQUANT_LAYER_HEAD_DIM: usize = 256;
