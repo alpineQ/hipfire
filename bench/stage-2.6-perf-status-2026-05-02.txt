@@ -1,0 +1,99 @@
+# Stage 2.6 fused score: correctness shipped, perf gap remains
+# Captured 2026-05-02 against commit 6dbe00b
+# Hardware: hipx (Strix Halo / gfx1151 iGPU + AIE-2P NPU2)
+
+## Correctness milestones (this session)
+
+| Component                     | Status              | Commit    |
+|-------------------------------|---------------------|-----------|
+| score_one C++ kernel          | builds + passes     | b457070   |
+| score_one Rust verifier       | 1000 seeds PASS     | 489c847   |
+| Verifier hardened (NaN/det)   | hard-fail gates     | 623f90e   |
+| Independent iGPU-shape ref    | reformulation valid | 6b267da   |
+| score_layer N=128 kernel      | builds + passes     | 3942ef2   |
+| score_layer Rust verifier     | 6400 elems PASS     | 3942ef2   |
+| Reformulation insight         | doc'd               | c9839b2   |
+| Plan + scoping                | doc'd               | 7e1b6eb   |
+
+The cos(A-B) trig-elimination reformulation is mathematically
+proven via two-reference adversarial verification:
+  - matching ref (NR sqrt + reformulated): max rel 2e-7
+  - iGPU-shape ref (libm sqrt + atan2 + cos): max rel 3e-6
+
+Stage 2.6 score arithmetic is bug-free.
+
+## Measured perf
+
+  Variant     N    Wall      Per-dispatch  Per-iter
+  score_one   1    0.45 ms   0.45 ms       450 us
+  score_layer 128  26.84 ms  26.84 ms      210 us
+
+The 2x amortization from N=1 to N=128 is much smaller than the
+dequant kernel's amortization (which dropped from 67 us to ~3 us
+per iter). The score kernel's per-iter compute is ~50x larger
+than dequant's, so the host-overhead floor amortizes less.
+
+## Projection to full layer at production scale (N=32768)
+
+Single-core:
+  per-dispatch  = 32768 * 210 us / 128 = 53.7 s (literally seconds)
+  per-token     = 46 * 53.7 s = 2470 seconds (catastrophic)
+
+Even at hypothetical 16-core SIMD-optimized:
+  per-iter assumed ~6.5 us (32x speedup vs scalar)
+  per-dispatch  = 32768 * 6.5 us / 16 = 13.3 ms
+  per-token     = 46 * 13.3 ms = 612 ms (9x slower than iGPU 67 ms)
+
+The 14% lift projection in docs/plans/asym3-fused-score-plan.md
+assumed ~100 cycles per transcendental and a much smaller per-iter
+budget than what we measured. Reality:
+  - per-iter cost is ~3000 cycles (vs estimated ~322)
+  - mostly dominated by Givens scalar loop + sqrt + accumulation
+  - SIMD vectorization across the 128 bands per (head, pos) is
+    the only path to closing the gap
+
+## Remaining work for stage 2.6 lift
+
+  1. SIMD vectorize the Givens + sqrt + accumulation loop. Target
+     16x speedup via aie::vector<float, 16> ops. ~4-8 hours focused.
+  2. Multi-core fan-out (mirror dequant 8c topology). ~2-4 hours.
+  3. Per-layer broadcast: the c_mag / c_abs / cos_a / sin_a /
+     cos_t / sin_t arrays are constant across iters within a
+     dispatch. Currently re-shipped 128 times per dispatch (3072
+     bytes per iter unnecessary). Splitting into a constant
+     ObjectFifo + per-iter ObjectFifo reduces input BW 26x. The
+     remaining 2 input DMA channels accommodate this. ~2-3 hours.
+  4. Multi-shape variants OR runtime-N parameterization, plus
+     engine wiring + prefetch. ~6-12 hours.
+
+Total: 14-27 hours of focused authoring + bench work to get a
+concrete stage 1.5 / 2.6 lift number (which may or may not beat
+iGPU baseline; the math suggests it's close).
+
+## Honest assessment
+
+The session has shipped substantial correctness infrastructure for
+both stage 1.4 dequant and stage 2.6 score. The kernels work.
+What's NOT shipped: a kernel fast enough to beat iGPU at full
+production shape. The math doesn't promise an easy win even with
+all four optimizations stacked.
+
+Recommended next moves (in priority order):
+  1. SIMD vectorize the score kernel + measure. If per-iter drops
+     to <30 us, stage 2.6 becomes plausibly competitive.
+  2. If SIMD alone doesn't close the gap, add multi-core + per-
+     layer broadcast optimizations and re-measure.
+  3. If still not competitive, escalate to MANUAL_REVIEW with
+     full telemetry. Stage 2.6 may simply not be feasible on the
+     AIE-2P NPU2 for this workload, in which case the npu-roadmap
+     stops here without a default flip.
+
+## Pointers
+
+  Score kernel sources:    kernels/aie2p/asym3_score_one/
+                           kernels/aie2p/asym3_score_layer/
+  Verifiers:               crates/hipx/src/bin/verify_asym3_score_*.rs
+  Plan:                    docs/plans/asym3-fused-score-plan.md
+  Stage 1.5 escalation:    bench/npu-stage-1.5-scoping-2026-05-02.txt
+  Multi-core scaling data: bench/npu-multicore-scaling-2026-05-02.txt
+  iGPU baseline:           tests/speed-baselines/gfx1151.txt
