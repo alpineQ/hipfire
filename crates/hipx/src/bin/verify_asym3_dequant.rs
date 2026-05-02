@@ -837,7 +837,7 @@ fn main() -> ExitCode {
     println!("  per-seed:       {} pass, {} fail across {} seeds",
              total_seeds_ok, total_seeds_fail, n_seeds);
     println!("  mode:           {} (set ASYM3_STRICT=1 for bit-for-bit)",
-             if strict { "strict bit-for-bit" } else { "AIE-2P-shape (<=2 ULP)" });
+             if strict { "strict bit-for-bit" } else { "AIE-2P-shape (<=4 ULP)" });
 
     let pass = all_determ && grand_max_ulp <= max_ulp_bound && mean_signed_ok;
     if pass {
