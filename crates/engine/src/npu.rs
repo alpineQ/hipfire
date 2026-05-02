@@ -58,6 +58,10 @@ pub struct NpuRuntime {
     matmul_bf16_512: Option<MatmulBf16512Kernel>,
     /// 1024×1024×1024 BF16 — 0.97 TOp/s sustained.
     matmul_bf16_1024: Option<MatmulBf161024Kernel>,
+    /// asym3 K-cache dequant kernel (head_dim=256, single head per
+    /// dispatch). Behind `HIPFIRE_NPU_DEQUANT=1` until stage 1.5
+    /// shows a measured tok/s lift; default off.
+    asym3_dequant_256: Option<Asym3Dequant256Kernel>,
 }
 
 /// Persistent state for the i16 288×288 matvec kernel. All BOs,
@@ -144,6 +148,23 @@ struct MatmulBf161024Kernel {
     cmd_bo: hipx::Bo,
 }
 
+/// Persistent state for the asym3 K-cache dequant kernel
+/// (head_dim = 256, single-head per dispatch).
+struct Asym3Dequant256Kernel {
+    ctx: hipx::hwctx::Hwctx,
+    _cu: hipx::cmd::CuBinding,
+    instr_bo: hipx::Bo,
+    /// 96 B = 32 threads x 3 packed bytes of 3-bit indices
+    packed_bo: hipx::Bo,
+    /// 4 B = one f32 magnitude factor (kernel converts to bf16 on read)
+    cnorm_bo: hipx::Bo,
+    /// 512 B = 256 bf16 dequanted K elements
+    out_bo: hipx::Bo,
+    bo3_bo: hipx::Bo,
+    bo4_bo: hipx::Bo,
+    cmd_bo: hipx::Bo,
+}
+
 #[derive(Default, Debug, Clone, Copy)]
 pub struct AvailableOps {
     /// 4 KiB byte passthrough (proved end-to-end via hipx-passthrough).
@@ -195,6 +216,7 @@ impl NpuRuntime {
             matmul_i8_1024: None,
             matmul_bf16_512: None,
             matmul_bf16_1024: None,
+            asym3_dequant_256: None,
         })
     }
 
@@ -216,13 +238,23 @@ impl NpuRuntime {
 }
 
 /// Per-op routing decision. Pure of side effects; only depends on
-/// the runtime's reported capabilities and the op shape.
+/// the runtime's reported capabilities, the op shape, and runtime
+/// flags.
+///
+/// Gating flags:
+/// - `HIPFIRE_NPU_DEQUANT=1` enables the asym3 K-cache dequant
+///   path (KvCodec). Default off until stage 1.5 shows a measured
+///   tok/s lift; per the npu-roadmap contract.
 pub fn route(npu: &Option<NpuRuntime>, op: OpClass) -> ComputeTarget {
     let Some(rt) = npu else {
         return ComputeTarget::Igpu;
     };
     let pdi_available = match op {
-        OpClass::KvCodec => rt.available_ops.kv_dequant,
+        OpClass::KvCodec => {
+            // Two gates: the kernel must be loaded AND the runtime
+            // flag must be set. Default off; flip once 1.5 ships.
+            rt.available_ops.kv_dequant && std::env::var("HIPFIRE_NPU_DEQUANT").is_ok()
+        }
         OpClass::Int8Gemm { .. } => rt.available_ops.int8_gemm,
         // Other op classes have no NPU kernel yet.
         OpClass::EmbeddingSidecar | OpClass::VisionEncoder | OpClass::Sampler { .. } => false,
@@ -1954,6 +1986,154 @@ impl NpuRuntime {
             let bytes: [u8; 4] = outp[i * 4..i * 4 + 4].try_into().unwrap();
             *slot = f32::from_le_bytes(bytes);
         }
+        Ok(())
+    }
+
+    /// asym3 K-cache dequant: takes one head's worth of asym3-packed
+    /// data + the per-head magnitude factor, returns 256 bf16 values
+    /// in the caller's `out` buffer (512 bytes).
+    ///
+    /// Stage 1.3 wiring. Lazy-init on first call (mirrors the
+    /// matmul_i8_1024 pattern). Bit-correctness vs the engine codebook
+    /// is bounded at 4 bf16 ULP per element with mean signed bias
+    /// <= 1 ULP per `verify_asym3_dequant` (see
+    /// `docs/plans/aie2p-bf16-mul-shape.md`). The caller decides
+    /// whether to dispatch via `route(OpClass::KvCodec)` which gates
+    /// on `HIPFIRE_NPU_DEQUANT=1`.
+    pub fn asym3_dequant_256(
+        &mut self,
+        packed: &[u8; 96],
+        cnorm: f32,
+        out: &mut [u8; 512],
+    ) -> Result<(), hipx::XdnaError> {
+        use hipx::cmd::{config_cus, submit_exec_cmd};
+        use hipx::ert::{reset_state, ErtBuilder};
+        use hipx::fence::timeline_wait;
+        use hipx::hwctx::HwctxBuilder;
+        use hipx::ioctl::{SYNC_FROM_DEVICE, SYNC_TO_DEVICE};
+        use hipx::kernels::{
+            asym3_dequant_256_args as args, ASYM3_DEQUANT_256_COLUMNS,
+            ASYM3_DEQUANT_256_INSTS, ASYM3_DEQUANT_256_OPS_PER_CYCLE,
+            ASYM3_DEQUANT_256_OUT_BYTES, ASYM3_DEQUANT_256_PACKED_BYTES,
+            ASYM3_DEQUANT_256_PDI,
+        };
+        use std::time::Duration;
+
+        if self.asym3_dequant_256.is_none() {
+            let mut hb = HwctxBuilder::default();
+            hb.num_columns = ASYM3_DEQUANT_256_COLUMNS;
+            hb.max_opc = ASYM3_DEQUANT_256_OPS_PER_CYCLE;
+            let ctx = self.hipx.create_hwctx(&hb)?;
+
+            let pdi_bo = self.hipx.alloc_dev(ASYM3_DEQUANT_256_PDI.len())?;
+            unsafe {
+                let buf = self.hipx.dev_slice(&pdi_bo)?;
+                buf[..ASYM3_DEQUANT_256_PDI.len()].copy_from_slice(ASYM3_DEQUANT_256_PDI);
+            }
+            let _ = pdi_bo.sync(SYNC_TO_DEVICE);
+            let cu = config_cus(self.hipx.device.fd, &ctx, vec![pdi_bo], &[0u8])?;
+
+            let instr_bo = self.hipx.alloc_dev(ASYM3_DEQUANT_256_INSTS.len())?;
+            unsafe {
+                let buf = self.hipx.dev_slice(&instr_bo)?;
+                buf[..ASYM3_DEQUANT_256_INSTS.len()].copy_from_slice(ASYM3_DEQUANT_256_INSTS);
+            }
+            let _ = instr_bo.sync(SYNC_TO_DEVICE);
+            let ninstr_dwords = (ASYM3_DEQUANT_256_INSTS.len() / 4) as u32;
+
+            let mut packed_bo = self.hipx.alloc_shmem(ASYM3_DEQUANT_256_PACKED_BYTES)?;
+            let mut cnorm_bo = self.hipx.alloc_shmem(4)?;
+            let mut out_bo = self.hipx.alloc_shmem(ASYM3_DEQUANT_256_OUT_BYTES)?;
+            let mut bo3_bo = hipx::Bo::alloc_shmem_exact(self.hipx.device.fd, 8)?;
+            let mut bo4_bo = hipx::Bo::alloc_shmem_exact(self.hipx.device.fd, 1)?;
+            let _ = packed_bo.map()?;
+            let _ = cnorm_bo.map()?;
+            let _ = out_bo.map()?;
+            let _ = bo3_bo.map()?;
+            let _ = bo4_bo.map()?;
+
+            let packed_va = packed_bo.host_ptr().unwrap() as u64;
+            let cnorm_va = cnorm_bo.host_ptr().unwrap() as u64;
+            let out_va = out_bo.host_ptr().unwrap() as u64;
+            let bo3_va = bo3_bo.host_ptr().unwrap() as u64;
+            let bo4_va = bo4_bo.host_ptr().unwrap() as u64;
+
+            let mut cmd_bo = self.hipx.alloc_cmd(4096)?;
+            {
+                let cbuf = cmd_bo.map()?;
+                let mut eb = ErtBuilder::new_start_cu(&mut cbuf[..256]);
+                eb.set_cu_mask(0x1);
+                eb.set_arg_u64(args::OPCODE, 3);
+                eb.set_arg_u64(args::INSTR_PTR, instr_bo.xdna_addr);
+                eb.set_arg_u32(args::NINSTR, ninstr_dwords);
+                eb.set_arg_u64(args::PACKED, packed_va);
+                eb.set_arg_u64(args::CNORM, cnorm_va);
+                eb.set_arg_u64(args::OUT, out_va);
+                eb.set_arg_u64(args::BO3, bo3_va);
+                eb.set_arg_u64(args::BO4, bo4_va);
+                let _ = eb.finalize(0x3C);
+            }
+            let _ = cmd_bo.sync(SYNC_TO_DEVICE);
+
+            self.asym3_dequant_256 = Some(Asym3Dequant256Kernel {
+                ctx,
+                _cu: cu,
+                instr_bo,
+                packed_bo,
+                cnorm_bo,
+                out_bo,
+                bo3_bo,
+                bo4_bo,
+                cmd_bo,
+            });
+            self.available_ops.kv_dequant = true;
+        }
+
+        let kern = self.asym3_dequant_256.as_mut().unwrap();
+        {
+            let pbuf = kern.packed_bo.map()?;
+            pbuf[..ASYM3_DEQUANT_256_PACKED_BYTES].copy_from_slice(packed);
+        }
+        let _ = kern.packed_bo.sync(SYNC_TO_DEVICE);
+        {
+            let cbuf = kern.cnorm_bo.map()?;
+            cbuf[..4].copy_from_slice(&cnorm.to_le_bytes());
+        }
+        let _ = kern.cnorm_bo.sync(SYNC_TO_DEVICE);
+        {
+            let obuf = kern.out_bo.map()?;
+            for byte in obuf[..ASYM3_DEQUANT_256_OUT_BYTES].iter_mut() { *byte = 0xCC; }
+        }
+        let _ = kern.out_bo.sync(SYNC_TO_DEVICE);
+        {
+            let cbuf = kern.cmd_bo.map()?;
+            reset_state(&mut cbuf[..4]);
+        }
+        let _ = kern.cmd_bo.sync(SYNC_TO_DEVICE);
+
+        let seq = submit_exec_cmd(
+            self.hipx.device.fd,
+            &kern.ctx,
+            &[&kern.cmd_bo],
+            &[
+                &kern.instr_bo,
+                &kern.packed_bo,
+                &kern.cnorm_bo,
+                &kern.out_bo,
+                &kern.bo3_bo,
+                &kern.bo4_bo,
+            ],
+        )?;
+        timeline_wait(
+            self.hipx.device.fd,
+            kern.ctx.syncobj_handle,
+            seq,
+            Duration::from_secs(5),
+        )?;
+
+        let _ = kern.out_bo.sync(SYNC_FROM_DEVICE);
+        let outp = kern.out_bo.map()?;
+        out.copy_from_slice(&outp[..ASYM3_DEQUANT_256_OUT_BYTES]);
         Ok(())
     }
 }
