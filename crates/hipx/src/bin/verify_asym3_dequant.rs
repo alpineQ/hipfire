@@ -251,6 +251,32 @@ fn run_one_seed(
         }
     }
 
+    // On mismatch, optionally dump diagnostic info if env set.
+    if diffs > 0 && std::env::var("ASYM3_DEBUG").is_ok() {
+        if let Some((d, cpu_bits, npu_bits)) = first_diff {
+            let tid = d / 8;
+            let i = d % 8;
+            let base = tid * 3;
+            let word = (packed[base] as u32)
+                | ((packed[base + 1] as u32) << 8)
+                | ((packed[base + 2] as u32) << 16);
+            let idx = ((word >> (i * 3)) & 7) as usize;
+            let cb_f32 = TURBO_C3_256[idx];
+            let cb_bf16 = f32_to_bf16_bits(cb_f32);
+            let cnorm_bf16 = f32_to_bf16_bits(cnorm);
+            let cb_b = bf16_bits_to_f32(cb_bf16);
+            let cnorm_b = bf16_bits_to_f32(cnorm_bf16);
+            let f32_product = cnorm_b * cb_b;
+            let bf16_via_rne = f32_to_bf16_bits(f32_product);
+            let bf16_via_trunc = (f32_product.to_bits() >> 16) as u16;
+            let cpu_f = bf16_bits_to_f32(cpu_bits);
+            let npu_f = bf16_bits_to_f32(npu_bits);
+            eprintln!(
+                "DEBUG dim {d} (tid {tid} i {i}) idx={idx} cb=0x{cb_bf16:04x}({cb_b:.7}) cnorm=0x{cnorm_bf16:04x}({cnorm_b:.7}) f32_prod={f32_product:.10} via_rne=0x{bf16_via_rne:04x} via_trunc=0x{bf16_via_trunc:04x} cpu=0x{cpu_bits:04x}({cpu_f:.7}) npu=0x{npu_bits:04x}({npu_f:.7})"
+            );
+        }
+    }
+
     Ok((diffs, first_diff))
 }
 
