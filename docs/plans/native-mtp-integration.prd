@@ -1,0 +1,496 @@
+# PRD: Native Qwen MTP integration for hipfire spec-decode
+
+**Status:** Draft 2026-05-09. Branch: `feat/native-mtp` (alpineQ fork, off PR #222 kernel
+fixes). PR #204 (hetero DFlash) closed without merge — see "Why this PRD" below.
+
+**Audience:** Fresh model context with no session memory. This document is
+self-contained: hardware, target model, all measured baselines, file layout,
+gotchas, validation gates, exit criteria.
+
+---
+
+## TL;DR
+
+Implement native Qwen3.6 Multi-Token Prediction (MTP) head support in hipfire
+to replace the DFlash external-drafter path on long-context decode. Empirical
+target: **45 tok/s on 16K Wikipedia canonical** (vs hipfire AR-only 39 tok/s,
+vs hipfire DFlash hetero 33 tok/s). Number is not aspirational — it is what
+llama.cpp's MTP path delivers on the same hardware/model/prompt today.
+
+Native MTP weights ship inside Qwen/Qwen3.6-27B's safetensors (15 tensors,
+~100 MB in mq4) but the hipfire quantizer currently strips them at
+`crates/hipfire-quantize/src/main.rs:2520`. Unstrip + add a forward path +
+wire spec-decode = ~1 month of focused work split across 5 small PRs.
+
+## Why this PRD (lessons from the dead end)
+
+The session that produced this branch tried to make DFlash hetero (drafter on
+GPU 1, target on GPU 0) competitive at 16K. After three commits — kernel
+j-partition (kept, PR #222), drafter sliding window (reverted as
+net-negative, see "Pitfall #1"), DDTree+hetero wiring — the best achievable
+DFlash hetero throughput at 16K Wikipedia prose is **33 tok/s**, vs AR-only
+**39 tok/s**. Speculation was actively losing per-token. Math: cycle wall
+75 ms × τ=1.45 → 30.2 ms/token > AR 25.6 ms/token.
+
+Then we benchmarked llama.cpp + Qwen3.6 native MTP via
+`/tmp/bench-prompts/run_llama_server.sh` with `--spec-type mtp
+--spec-draft-n-max 8` on the same prompt md5 (`d21ebdd2e3204c1788a7f2681d60c38a`)
+and got **45.4 ± 0.2 tok/s** steady-state (5 runs). Acceptance rate 0.44 ×
+n_max 8 → effective τ ≈ 3.5. On a code prompt (`/tmp/code_prompt.txt`,
+HumanEval-style): **62 tok/s**, τ ≈ 4.5.
+
+The DFlash approach is structurally weaker because the z-lab drafter we use
+is 5 layers trained externally; Qwen team's native MTP is 1 layer trained
+properly with their data and compute. Smaller drafter, higher τ. Switching
+to native MTP is the single highest-ROI change available.
+
+We also tested Lucebox PR #26 / hipfire issue #78 (target-side sliding-window
+FA) on its existing branch `feat/sliding-window-fa`. At 16K context the
+claimed 3.48× win does not materialize — all window sizes (W=128 / 512 / 2048
+/ full) give 38.4–38.8 tok/s. Lucebox's win shows up at 60K+ where target FA
+dominates over weight reads; at 16K the model is still weight-bandwidth-bound,
+not attention-compute-bound. **Do not pursue #78 for our 16K workload.**
+
+## Hardware and reference points
+
+- Machine: k9lin (NixOS), 2× AMD Radeon RX 7900 XTX (gfx1100 / RDNA3, 24 GB
+  each).
+- ROCm 7.x via nixpkgs (`nix-shell -p rocmPackages.{clr,rocblas,hipblas,
+  rocm-runtime,rocm-device-libs}`).
+- Build: `nix-shell -p ... --run 'cargo build --release --features deltanet
+  --example daemon'`.
+- Source `./scripts/rocm-env.sh` before running daemon outside nix-shell
+  (sets LD_LIBRARY_PATH for libamdhip64.so).
+
+Models in `/mnt/data4/.hipfire/models/`:
+- `qwen3.6-27b.mq4` (14 GB on disk, MQ4-G256 quant, **mtp.* tensors stripped
+  by current quantizer**)
+- `qwen36-27b-dflash-mq4.hfq` (877 MB, z-lab DFlash drafter — **not used by
+  native MTP path; kept for backward compatibility**)
+
+GGUF reference build (for comparison only, not a dependency):
+- `/mnt/data4/lmstudio/RDson/Qwen3.6-27B-MTP-Q4_K_M-GGUF/Qwen3.6-27B-MTP-Q4_K_M.gguf`
+- llama.cpp at `/home/alpineq/projects/llama.cpp` (build at `build/bin/llama-server`,
+  has `--spec-type mtp --spec-draft-n-max <N>`).
+
+Bench prompts (canonical, all comparisons must use these md5s exactly per
+CLAUDE.md prompt-md5 rule):
+- `/tmp/bench-prompts/prompt_16384.txt` — 16139 BPE tokens of Wikipedia prose,
+  md5 `d21ebdd2e3204c1788a7f2681d60c38a`.
+- `/tmp/code_prompt.txt` — HumanEval-style stub for code-prediction tests.
+- `/tmp/tau-sanity-prompt.txt` — 980 BPE prose slice (md5 `4fc5e17f...`).
+
+Bench tooling that works:
+- `python3 /tmp/fa_bench.py <window> <max_seq>` for hipfire daemon — spawns
+  daemon, sends `{"type":"load"}`, blocks reading stdout JSON until it sees
+  `"type":"loaded"` event, sends `{"type":"generate"}`, blocks until
+  `"type":"done"`. **No sleeps. No grep loops.** Pattern documented at end.
+
+## Target performance
+
+Steady-state on the prompts above, single-card mode (target on GPU 0):
+
+| Setup | 16K Wikipedia | Code prompt | 980 BPE prose |
+|---|---|---|---|
+| AR-only baseline (hipfire today) | 39.0 tok/s | (?) | (?) |
+| llama.cpp + native MTP n_max=8 | 45.4 tok/s | 62.4 tok/s | (?) |
+| **hipfire + native MTP target** | **≥ 44 tok/s** | **≥ 60 tok/s** | **≥ 50 tok/s** |
+| hipfire DFlash hetero best (closed PR #204) | 33 tok/s | 60+ | 49 |
+
+Acceptance for the integration PR is matching llama.cpp's tok/s within 5 %
+on the 16K canonical bench. If we land at 42 tok/s instead of 45 we still
+beat AR by 8 %; that's the floor. Below AR is failure.
+
+## What native MTP is, structurally
+
+Qwen3.6-27B's `config.json` declares:
+
+```json
+"mtp_num_hidden_layers": 1,
+"mtp_use_dedicated_embeddings": false
+```
+
+The model has **15 extra tensors** under `mtp.*`, listed verbatim from
+`https://huggingface.co/Qwen/Qwen3.6-27B/raw/main/model.safetensors.index.json`:
+
+```
+mtp.fc.weight                                     # ~50 MB bf16
+mtp.pre_fc_norm_embedding.weight                  # tiny
+mtp.pre_fc_norm_hidden.weight                     # tiny
+mtp.layers.0.input_layernorm.weight               # tiny
+mtp.layers.0.self_attn.{q,k,v,o}_proj.weight      # ~25 MB each in bf16
+mtp.layers.0.self_attn.{q,k}_norm.weight          # tiny
+mtp.layers.0.post_attention_layernorm.weight      # tiny
+mtp.layers.0.mlp.{gate,up,down}_proj.weight       # ~90 MB each in bf16
+mtp.norm.weight                                   # tiny
+```
+
+In mq4 the whole MTP block is ~100 MB on disk.
+
+Architecturally it is **one extra Qwen3.5-style FullAttention decoder block**
+glued to the trunk's last hidden state via an "fc" projection that combines
+the trunk's hidden state with the next-token embedding:
+
+```
+inputs to MTP head:
+  h_input  = trunk's final hidden state at the most recent committed position
+  tok_id   = the last committed token
+
+# Pre-block fusion:
+h_norm  = RMSNorm(h_input,        weights.mtp.pre_fc_norm_hidden)
+e_norm  = RMSNorm(embed[tok_id],  weights.mtp.pre_fc_norm_embedding)
+fused   = Linear([e_norm; h_norm], weights.mtp.fc)        # 2*hidden -> hidden
+
+# Standard Qwen3.5 FullAttn block (mtp.layers.0.*):
+x = fused
+x_norm = RMSNorm(x, mtp.layers.0.input_layernorm)
+Q,K,V  = wq, wk, wv on x_norm; q_norm/k_norm; RoPE
+attn   = SDPA(Q, K, V) ; o_proj
+x      = x + attn                                          # residual
+x_norm = RMSNorm(x, mtp.layers.0.post_attention_layernorm)
+ffn    = SwiGLU via gate_proj/up_proj/down_proj
+x      = x + ffn                                           # residual
+out    = RMSNorm(x, mtp.norm)
+logits = Linear(out, weights.output)                       # share trunk's lm_head
+```
+
+Reference: llama.cpp's `src/models/qwen35_mtp.cpp` (read-only — do not copy
+ggml graph code, but the tensor wiring and order are correct there).
+
+### Multi-token rollout
+
+A single MTP head call produces ONE speculative token from the previous
+hidden state. To draft K tokens per cycle (`--spec-draft-n-max 8` empirical
+sweet spot at 16K), run K MTP head calls sequentially:
+
+- Iteration 0: `(h_n, tok_n)` from trunk → predicts `tok_n+1`, produces `h'_n+1`
+- Iteration 1: `(h'_n+1, tok_n+1)` → `tok_n+2`, `h'_n+2`
+- … K total
+
+The MTP block has its **own KV cache** (cleared / advanced once per spec
+cycle, much smaller than trunk's because it covers 1 layer × K positions).
+After the verify step accepts L tokens (0 ≤ L ≤ K), the MTP KV cache must
+be rewound to position `n + L + 1`.
+
+`n_max` discovery: at 16K Wikipedia we measured n_max=3 → 31.8 tok/s,
+n_max=8 → 45.4 tok/s, n_max=16 → 20.8 tok/s (compound prediction error
+collapses acceptance). **Default n_max=8.** Make it env-var overridable.
+
+## Build sequence (PRs)
+
+Each step is independently mergeable (or revertable) and ends with a
+verifiable green gate. Ship in order — later PRs depend on earlier ones.
+
+### PR-MTP-1: Quantizer + config plumbing
+
+Goal: produce `qwen3.6-27b-mtp.mq4` containing the mtp.* tensors. No
+runtime behavior change yet — file just gets bigger.
+
+**Files:**
+- `crates/hipfire-quantize/src/main.rs:2520` — replace the `if
+  name.starts_with("mtp.")` skip with explicit `--include-mtp` flag (default
+  off so existing quant flows are byte-identical). When set, mtp.* tensors
+  go through the same MQ4-G256 pipeline as everything else.
+- `crates/hipfire-arch-qwen35/src/qwen35.rs` — extend `Qwen35Config` with:
+  - `mtp_num_hidden_layers: usize` (default 0 — feature off when 0)
+  - `mtp_use_dedicated_embeddings: bool` (default false)
+  - Parse from HF JSON in `config_from_hfq` (`text_config.mtp_num_hidden_layers`).
+  - Pass through HFQM metadata so the runtime sees it without re-reading HF.
+
+**Validation:**
+- `cargo build --release --features deltanet --example daemon` clean.
+- Re-quantize: `target/release/dflash_convert ...` — wait, dflash_convert is
+  for drafter format. The right tool is `crates/hipfire-quantize/src/main.rs`
+  built as a separate binary. Read `crates/hipfire-quantize/src/bin/` for
+  invocation. Run with `--include-mtp` against
+  `Qwen/Qwen3.6-27B/snapshots/<sha>` — output should be a new mq4 file ~100 MB
+  larger than the existing one. Save to
+  `/mnt/data4/.hipfire/models/qwen3.6-27b-mtp.mq4`.
+- Existing `qwen3.6-27b.mq4` flows unchanged: load it, run AR — no regression.
+- Coherence-gate `./scripts/coherence-gate.sh` PASS (env unset = byte-exact
+  preserved).
+
+### PR-MTP-2: MTP weights struct + loader
+
+Goal: load the mtp.* tensors into a typed Rust struct on the GPU. No
+forward-pass usage yet — just verify they exist where expected.
+
+**Files:**
+- `crates/hipfire-arch-qwen35/src/qwen35.rs`:
+  - New `pub struct MtpWeights { fc: WeightTensor, pre_fc_norm_hidden:
+    GpuTensor, pre_fc_norm_embedding: GpuTensor, layer:
+    FullAttnLayerWeights, norm: GpuTensor }` (re-uses `FullAttnLayerWeights`
+    because the MTP block IS a FullAttn layer).
+  - Add `mtp: Option<MtpWeights>` to `Qwen35Weights`.
+  - In `load_weights`, after the main-layer loop: if
+    `config.mtp_num_hidden_layers > 0`, look for `mtp.fc.weight` etc. and
+    populate. If absent (legacy mq4 file), set `mtp = None` and log a
+    warning.
+- `Qwen35Weights::free_gpu`: add an `if let Some(mtp) = self.mtp` branch
+  that frees all 15 GPU buffers — easy to forget, leaks bytes if you do.
+
+**Validation:**
+- Load `qwen3.6-27b-mtp.mq4` — daemon prints `[mtp] loaded: 15 tensors,
+  total ~100 MB`. VRAM budget check: target weights 14 GB + KV asym3 4 GB +
+  activations 1.5 GB + MTP ~0.1 GB = ~19.6 GB → fits 24 GB card with room.
+- Load `qwen3.6-27b.mq4` (legacy, no mtp.*) — daemon logs `[mtp] not
+  present, falling back to AR / DFlash`. No crash.
+- `./scripts/coherence-gate.sh` PASS.
+
+### PR-MTP-3: MTP forward kernel chain
+
+Goal: implement the standalone MTP-head forward pass. Takes
+`(h_input: GpuTensor, tok_id: u32, kv_state: &mut MtpKvState, pos: usize)`,
+returns `(h_output: GpuTensor, logits: GpuTensor)`. No spec-decode wiring.
+
+**Files:**
+- `crates/hipfire-arch-qwen35/src/qwen35.rs` (or new `mtp.rs` module under
+  same crate — same convention as `pflash.rs`):
+  - `pub struct MtpKvState { k_cache: GpuTensor, v_cache: GpuTensor,
+    capacity: usize, len: usize }` — the MTP block's KV cache. Capacity =
+    n_max + a few slots of headroom; lives on the same GPU as `mtp.layer`.
+  - `pub fn mtp_forward(gpu, weights, config, h_input, tok_id, kv_state,
+    pos) -> (GpuTensor, GpuTensor)`:
+    1. Embedding lookup for `tok_id` into `e` (re-use one of the existing
+       `gpu.embedding_lookup_*` based on `weights.embd_format`).
+    2. RMSNorm `e_norm = e * mtp.pre_fc_norm_embedding`.
+    3. RMSNorm `h_norm = h_input * mtp.pre_fc_norm_hidden`.
+    4. Concat `[e_norm; h_norm]` into a 2*dim buffer, then GEMM with
+       `mtp.fc` to produce a `dim`-sized vector. **Reuse the dispatch
+       routing from `gemm_dispatch`** so all weight quant types
+       (HFQ4G256/MQ4G256/MQ3G256/HFQ6G256/MQ6G256/Q8_0) are handled the
+       same way the trunk's wq/wk/wv are.
+    5. Run a Qwen3.5 FullAttn block forward over batch=1 using the existing
+       building blocks: `attn_norm` → Q/K/V GEMMs → q_norm/k_norm → RoPE →
+       attention → `o_proj` → residual → `post_attention_layernorm` →
+       SwiGLU FFN → residual.
+    6. RMSNorm with `mtp.norm`, then GEMM with `weights.output` (shared
+       lm_head) to produce logits.
+- A tiny CLI test example `crates/hipfire-runtime/examples/mtp_smoke.rs`:
+  load model, run trunk forward 1 step, take `h_n`, run `mtp_forward` 8
+  times in a chain, dump the 8 predicted tokens. Compare against
+  llama.cpp's MTP output on the same input prompt — argmaxes must match
+  for the first 1–2 positions (later positions diverge due to FP order in
+  reductions; that's fine and expected).
+
+**Pitfalls (carefully read CLAUDE.md before this PR):**
+- Coherence-gate-dflash threshold: any change touching `mtp_forward` output
+  distribution must pass it once a spec-decode path is wired (PR-MTP-4).
+- partial_rotary_factor: Qwen3.6 uses 0.25 (only 64 of 256 head_dim get
+  RoPE'd). The MTP block follows the same convention — reuse the trunk's
+  `rope_partial_interleaved_f32_batched` kernel, do not write a new one.
+- gemm_dispatch returns errors; propagate them. Don't `.unwrap()` at runtime.
+
+**Validation:**
+- `mtp_smoke.rs` runs end-to-end without panic.
+- Per-token argmax: position 0 matches llama.cpp; positions 1–7 match in ≥
+  70 % of test prompts (drift is expected from FP non-associativity in
+  reductions, per CLAUDE.md ksplit-atomicAdd note).
+- VRAM diff: about + (n_max × 1 layer × KV bytes) over baseline; must stay
+  under the 22 GB ceiling.
+
+### PR-MTP-4: spec_step_mtp + daemon wiring
+
+Goal: end-to-end native MTP spec-decode. The deliverable.
+
+**Files:**
+- `crates/hipfire-arch-qwen35/src/speculative.rs`:
+  - New `pub fn spec_step_mtp(gpu: &mut Gpu, target: &mut ModelSlot,
+    target_snap: &mut DeltaNetSnapshot, mtp_kv: &mut MtpKvState,
+    verify_scratch: &VerifyScratch, position: usize, seed_token: u32,
+    n_max: usize) -> HipResult<SpecStepResult>`. **Returns the same
+    `SpecStepResult` shape as `spec_step_dflash`** so the daemon decode
+    loop is unchanged downstream.
+  - Per-cycle flow:
+    1. Run `qwen35::forward_scratch_with_hidden` for `seed_token` on
+       target trunk to advance trunk by 1 position; capture final hidden
+       state `h_n` (need to extend the existing function or add a sibling
+       that exposes the pre-output-norm hidden state — see llama-graph.h's
+       `t_h_pre_norm` for the analogue in llama.cpp).
+    2. Snapshot DeltaNet pre-rollout (`target_snap.save_from`).
+    3. K=n_max-token MTP rollout: chain `mtp_forward`, accumulating
+       speculative tokens into `drafted: Vec<u32>` of length n_max.
+    4. Build `verify_tokens = [seed_token, drafted[0], drafted[1], ...,
+       drafted[n_max-1]]`, length n_max+1.
+    5. Run `verify_dflash_block(...)` (the existing batched verify) over
+       these. Argmax-per-position is target's prediction.
+    6. Acceptance walk: greedy longest prefix match between
+       `drafted[i]` and `target_argmax[i]` for i=0..n_max-1.
+    7. Restore DeltaNet to pre-rollout snapshot, then replay accepted
+       prefix on trunk to advance trunk state by `(accept_len + 1)`
+       positions. The replay path is the same as in `spec_step_dflash`
+       step 10.
+    8. Rewind `mtp_kv` to position `n + accept_len + 1`. Set
+       `mtp_kv.len -= (n_max - accept_len)`.
+    9. Return `SpecStepResult { accepted: accept_len, bonus_token,
+       drafted, committed }`.
+- `crates/hipfire-runtime/examples/daemon.rs`:
+  - At load time: detect `weights.mtp.is_some()`. If yes and
+    `HIPFIRE_SPEC_TYPE` is unset or set to `mtp`, allocate a `MtpKvState`
+    and route the decode loop to `spec_step_mtp` instead of
+    `spec_step_dflash`.
+  - Env vars:
+    - `HIPFIRE_SPEC_TYPE=mtp|dflash|none` — explicit override (default
+      auto: prefer MTP if available, fall back to DFlash if a drafter
+      file is provided, else AR).
+    - `HIPFIRE_MTP_N_MAX` — integer, default 8. Empirically validated
+      sweet spot for 16K Wikipedia (n_max=3 too cautious, n_max=16
+      collapses). **Document this default carefully.**
+
+**Validation:**
+- `coherence-gate.sh` PASS (no MTP env set = no behavior change for non-MTP
+  models / legacy mq4).
+- Coherence eyeball with MTP enabled: 287-token continuation of canonical
+  16K prompt produces fluent biographical prose ending in `<|im_end|>`,
+  unique-token-ratio > 0.5, top-token freq < 10 %, no attractor (per
+  CLAUDE.md DFlash gate rules — same coherence check applies).
+- `python3 /tmp/fa_bench.py 0 16400` clone but with MTP-enabled daemon: 5
+  runs at MAX_TOK=128, target ≥ 44 tok/s steady-state. **HARD GATE.**
+- τ-sanity 980 BPE × 3: τ ≥ 2.5, decode_tok_s ≥ 50 tok/s.
+- 1 K bisect MTP-disabled: τ=1.14 cycles=7 decode≈36 — bit-exact baseline.
+- Single-card 27B + MTP at 16K: VRAM peak < 22 GB (must NOT overflow into
+  system memory swap; if so, increase `kv_mode=asym3`'s compaction or fail
+  cleanly).
+
+### PR-MTP-5: Performance polish (optional, after PR-MTP-4 ships)
+
+Per-B verify graph cache currently re-captures for each distinct
+`verify_tokens.len()` (issue #42). With MTP at n_max=8 the cycle B is
+typically n_max+1=9 every cycle (constant!), so this should be a non-issue
+in steady state — but verify with `HIPFIRE_VERIFY_GRAPH_TIMING=1` early in
+PR-MTP-4 and if there's variance, file a follow-up under #42.
+
+If 5 % more is wanted on top: combine with `b80e85b` (Phase C j-partition
+in `attention_dflash_f32`) — already on this branch from PR #222 — that
+applies to the DFlash drafter's attention only. The MTP block uses
+`attention_flash_asym3_*` (the trunk's FA), which has its own optimization
+roadmap (Lucebox `feat/sliding-window-fa` if 60K+ context becomes a
+target).
+
+## Pitfalls discovered in this session — DO NOT REPEAT
+
+1. **Drafter-side sliding window is the WRONG lever.**  Cutting drafter's
+   attention context to last W tokens drops τ (drafter sees less, predicts
+   worse) faster than it speeds up the cycle. Per-token throughput went
+   below AR. Reverted in this branch (`6ba16a2` is gone). Lucebox's #78
+   targets the **target side** (`attention_flash_asym3_*` kernels), not
+   the drafter — and at 16K context, even the target-side window doesn't
+   help (verified locally; FA isn't bottleneck at 16K, weight reads are).
+
+2. **Don't poll daemon stdout with sleeps + greps.**  Use Python with
+   `subprocess.Popen(stdout=PIPE, bufsize=1, text=True)` and
+   `readline()` — daemon emits one JSON event per line; block on
+   `readline()` until you see the type/id you want. Reference
+   implementation:
+
+   ```python
+   p = subprocess.Popen([daemon], stdin=PIPE, stdout=PIPE, text=True, bufsize=1, env=env)
+   p.stdin.write(json.dumps({"type": "load", ...}) + "\n"); p.stdin.flush()
+   while True:
+       line = p.stdout.readline()
+       if not line: sys.exit("daemon EOF")
+       ev = json.loads(line)
+       if ev["type"] == "loaded": break
+       if ev["type"] == "error": sys.exit(ev)
+   p.stdin.write(json.dumps({"type": "generate", ...}) + "\n"); p.stdin.flush()
+   # ... await "done" the same way
+   ```
+
+   Working copy at `/tmp/fa_bench.py`.
+
+3. **Per-B graph capture is a real warmup tax** — when DDTree path_c
+   produces variable tree sizes (B = 2..5), each B re-captures the verify
+   graph at ~250 ms each. MTP at fixed n_max keeps B constant so this is
+   non-issue, but if you ever vary n_max per cycle you'll eat 4× warmup.
+   See open issue #42 for the proper fix (mutable `hipGraphExec`).
+
+4. **NixOS + heavy nix-shell packages = source builds you can't kill.**
+   `nix-shell -p python311Packages.torchWithRocm` at the wrong nixpkgs
+   channel triggered an in-tree pytorch source build that I tried to
+   abort. The build runs as `nixbld1`; killing it requires `pkexec`
+   because nix-daemon is root and the user can't reach those processes.
+   ALWAYS pre-flight with `nix-store --realise --dry-run -p
+   <package>` before invoking nix-shell on heavy ML packages. If the
+   dry-run shows non-trivial `would build`, abort and find a binary
+   cache (or skip).
+
+5. **bitsandbytes-rocm on gfx1100 is sketchy** and not needed for this
+   PRD — MTP integration uses our existing MQ4-G256 quant pipeline.
+   Don't drag bnb into the picture.
+
+6. **The mtp.* tensors are stripped by the quantizer today.** The
+   existing `qwen3.6-27b.mq4` in `/mnt/data4/.hipfire/models/` does NOT
+   have them. PR-MTP-1 must re-quantize from HuggingFace source
+   (`Qwen/Qwen3.6-27B`) to a new file. Don't expect to read mtp.* out
+   of the existing mq4 — it's not there.
+
+7. **τ ≠ tok/s.** Reporting τ is meaningless without per-token wall.
+   We had a config showing τ=10 at synthetic 4K (cycles=2, looks great)
+   that was actually slower than AR per-token because the cycles were
+   long. Always state both `decode_tok_s` and `τ` from the same `done`
+   event, and compute `per_token_ms = 1000 / decode_tok_s` for direct
+   AR comparison.
+
+## Validation contract (apply at every PR boundary)
+
+1. `./scripts/coherence-gate.sh` — must PASS with env unset (no
+   regression on non-MTP models/flags). 6 models, no hard errors.
+   Pass-criterion: not byte-exact (norm convention can legitimately
+   shift output) but human-eyeballed coherent.
+2. `./scripts/coherence-gate-dflash.sh` — runs only when DFlash assets
+   present; will SKIP cleanly on this machine (we have qwen3.6 not
+   qwen3.5 27B fixtures). Don't fail on its skip — that's documented
+   expected behavior in `PR3-STEP3-PLAN.md` and `CLAUDE.md`.
+3. AR baseline non-regression at 1K and 4K: `MODE=single MAX_SEQ=4096
+   /tmp/smoke-bisect.sh 1024` → τ=1.14 cycles=7 decode_tok_s≈36 (this
+   is actually DFlash-default smoke when a drafter is registered;
+   should be unchanged when MTP env is unset).
+4. AR @ 16K via `python3 /tmp/fa_bench.py 0 16400` — must stay 38–40
+   tok/s on the 27B target (we measured 39 on master, 38.8 on
+   sliding-window-fa branch — same model, same hardware, run-to-run
+   noise).
+5. **MTP @ 16K — the PR-MTP-4 hard gate**: `python3 /tmp/mtp_bench.py
+   <env vars>` (sibling of `fa_bench.py` to be added) ≥ 44 tok/s
+   steady-state (5 runs, mean − 1 σ).
+
+## Out of scope
+
+- **PR4 PFlash + DFlash composition** (`docs/plans/hetero-pflash-dflash.prd`).
+  Orthogonal feature; ship after MTP integration is stable.
+- **DFlash hetero on MoE drafters** (issue #92). Z-lab DFlash drafts for
+  qwen3.5/3.6 35B-A3B exist; not relevant to dense-27B MTP.
+- **Drafter retraining** (issue #39, Path C). Native MTP makes this less
+  urgent — Qwen team's training is already adequate at 16K.
+- **#78 sliding-window FA**. Don't pursue at 16K context. If a long-context
+  use case (60K+) becomes prioritized, revisit; the upstream branch
+  `feat/sliding-window-fa` has Phase 1+3 ready for review.
+- **DDTree on hybrid arch RoPE skew** (issue #41). Only matters if DDTree
+  resurfaces; native MTP doesn't use DDTree.
+
+## Branches and PRs related to this work
+
+- `feat/native-mtp` — this work, off `feat/dflash-attn-kernel-fix` (PR #222).
+- `feat/dflash-attn-kernel-fix` — PR #222, kernel improvements
+  (`1083d48` tiled online-softmax + `b80e85b` Phase C j-partition).
+  Lands independently. Native MTP doesn't use the DFlash kernel directly,
+  but the fixes belong on master regardless.
+- `feat/hetero-dflash-pr2-drafter-pinning` — PR #204, CLOSED 2026-05-09.
+  Contains step-2/step-4 hetero plumbing that didn't deliver throughput.
+  Reference only.
+- `feat/sliding-window-fa` — upstream branch (Kaden), Phase 1+3 of issue
+  #78. Not in our master, not pulled. **Do not block on or pursue.**
+
+## Reference reading (in priority order for the implementer)
+
+1. This PRD.
+2. `CLAUDE.md` (top-level project rules — coherence gates, prompt-md5
+   discipline, MQ4 quantization, hetero rules).
+3. `crates/hipfire-arch-qwen35/src/qwen35.rs` lines 70–340 (`Qwen35Config`,
+   `Qwen35Weights`, layer structs).
+4. `crates/hipfire-arch-qwen35/src/speculative.rs` lines 2403–3340
+   (`spec_step_dflash`) — pattern to mirror for `spec_step_mtp`.
+5. `/home/alpineq/projects/llama.cpp/src/models/qwen35_mtp.cpp` — the
+   reference MTP graph. Read for tensor wiring, do NOT copy ggml code.
+6. `https://huggingface.co/Qwen/Qwen3.6-27B/raw/main/config.json` and
+   `model.safetensors.index.json` — source of truth for tensor names
+   and shapes.
